@@ -3,7 +3,14 @@ AETHERIS — Página de Chat con streaming SSE, HITL y entrada de audio.
 """
 import json
 import os
+import sys
 import uuid
+from pathlib import Path
+
+# Garantiza que la raíz del proyecto esté en sys.path
+_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
 import requests
 import streamlit as st

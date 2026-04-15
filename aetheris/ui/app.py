@@ -2,7 +2,16 @@
 AETHERIS Streamlit entry point.
 Run with: streamlit run aetheris/ui/app.py
 """
+import sys
 import uuid
+from pathlib import Path
+
+# Ensure the project root (Aetheris/) is in sys.path so the 'aetheris'
+# package is importable both in app.py and in all pages run by st.navigation.
+_project_root = str(Path(__file__).resolve().parent.parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import streamlit as st
 
 st.set_page_config(

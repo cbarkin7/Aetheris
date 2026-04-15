@@ -17,10 +17,15 @@ async def get_mcp_tools(include_tavily: bool = True, include_google: bool = True
     Start MCP servers and return a flat list of LangChain-compatible BaseTool objects.
     Falls back gracefully if a server fails to start (missing API key, npx not installed, etc.).
     """
+    logger.info(
+        "[MCP] → get_mcp_tools | inicio | tavily=%s google=%s",
+        include_tavily, include_google,
+    )
+
     try:
         from langchain_mcp_adapters.client import MultiServerMCPClient
     except ImportError:
-        logger.error("langchain-mcp-adapters is not installed. Run: pip install langchain-mcp-adapters")
+        logger.error("[MCP] → get_mcp_tools | langchain-mcp-adapters no instalado | pip install langchain-mcp-adapters")
         return []
 
     settings = get_settings()
@@ -28,25 +33,32 @@ async def get_mcp_tools(include_tavily: bool = True, include_google: bool = True
 
     if include_tavily and settings.tavily_api_key:
         servers["tavily"] = get_tavily_server_config()
+        logger.debug("[MCP] → get_mcp_tools | servidor Tavily configurado")
     else:
-        logger.info("Tavily MCP skipped (no API key or disabled)")
+        logger.info("[MCP] → get_mcp_tools | Tavily omitido (sin API key o desactivado)")
 
     if include_google and settings.google_client_id and settings.google_refresh_token:
         servers["google"] = get_google_server_config()
+        logger.debug("[MCP] → get_mcp_tools | servidor Google configurado")
     else:
-        logger.info("Google MCP skipped (no credentials or disabled)")
+        logger.info("[MCP] → get_mcp_tools | Google omitido (sin credenciales o desactivado)")
 
     if not servers:
-        logger.warning("No MCP servers configured — agent will run without external tools")
+        logger.warning("[MCP] → get_mcp_tools | sin servidores configurados → agente sin herramientas externas")
         return []
 
+    logger.info("[MCP] → get_mcp_tools | servidores=%s | iniciando conexión", list(servers.keys()))
     tools: list[Any] = []
     client = MultiServerMCPClient(servers)
     try:
         tools = await client.get_tools()
-        logger.info("Loaded %d MCP tools from %d server(s)", len(tools), len(servers))
+        tool_names = [t.name for t in tools]
+        logger.info(
+            "[MCP] → get_mcp_tools | completado | tools=%d nombres=%s",
+            len(tools), tool_names,
+        )
     except Exception as exc:
-        logger.error("Failed to load MCP tools: %s", exc)
+        logger.error("[MCP] → get_mcp_tools | error al cargar tools | %s", exc)
 
     return tools
 
@@ -62,7 +74,7 @@ async def get_mcp_tools_persistent(
     try:
         from langchain_mcp_adapters.client import MultiServerMCPClient
     except ImportError:
-        logger.error("langchain-mcp-adapters is not installed.")
+        logger.error("[MCP] → get_mcp_tools_persistent | langchain-mcp-adapters no instalado.")
         return None, []
 
     settings = get_settings()

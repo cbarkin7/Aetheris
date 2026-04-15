@@ -1,5 +1,12 @@
 """Página de carga y gestión de documentos."""
 import os
+import sys
+from pathlib import Path
+
+# Garantiza que la raíz del proyecto esté en sys.path
+_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
 import requests
 import streamlit as st

@@ -103,21 +103,39 @@ def input_guardrail_node(state: AgentState) -> dict:
     Si detecta inyección de prompt, bloquea y redirige a llm_node con rechazo.
     Si hay PII, redacta el mensaje y continúa normalmente.
     """
+    user_id = state.get("user_id", "?")
+
     if not get_settings().guardrails_enabled:
+        logger.debug("[GUARDRAIL-IN] → input_guardrail_node | saltado | guardrails desactivados")
         return {"guardrail_passed": True, "guardrail_violations": []}
 
     last_human = _last_human(state["messages"])
     if not last_human:
+        logger.debug("[GUARDRAIL-IN] → input_guardrail_node | saltado | sin mensaje humano")
         return {"guardrail_passed": True, "guardrail_violations": []}
 
     text = last_human.content if isinstance(last_human.content, str) else ""
+    logger.info(
+        "[GUARDRAIL-IN] → input_guardrail_node | inicio | user='%s' msg_len=%d",
+        user_id, len(text),
+    )
+
     result = _get_input_guard().check(text)
 
     if not result.passed:
-        logger.warning("Guardrail de entrada bloqueó mensaje: %s", result.violations)
+        logger.warning(
+            "[GUARDRAIL-IN] → input_guardrail_node | BLOQUEADO | user='%s' violaciones=%s",
+            user_id, result.violations,
+        )
         return {"guardrail_passed": False, "guardrail_violations": result.violations}
 
-    if result.redactions and result.sanitized_text != text:
+    redacted = result.redactions and result.sanitized_text != text
+    logger.info(
+        "[GUARDRAIL-IN] → input_guardrail_node | completado | passed=True redacciones_pii=%s",
+        len(result.redactions) if redacted else 0,
+    )
+
+    if redacted:
         return {
             "guardrail_passed": True,
             "guardrail_violations": [],
@@ -134,9 +152,12 @@ def input_guardrail_node(state: AgentState) -> dict:
 def load_memory_node(state: AgentState) -> dict:
     """Carga preferencias a largo plazo del usuario e inyecta contexto de mem0."""
     user_id = state.get("user_id", "default")
+    logger.info("[MEMORIA-CARGA] → load_memory_node | inicio | user='%s'", user_id)
+
     memory = load_user_memory(user_id)
 
     last_human = _last_human(state["messages"])
+    mem0_ok = False
     if last_human:
         query = last_human.content if isinstance(last_human.content, str) else ""
         try:
@@ -145,15 +166,19 @@ def load_memory_node(state: AgentState) -> dict:
             mem0_snippets = [r.get("memory", "") for r in mem0_results if r.get("memory")]
             if mem0_snippets:
                 memory["_mem0_context"] = " | ".join(mem0_snippets)
+                mem0_ok = True
         except Exception as exc:
-            logger.debug("mem0 no disponible: %s", exc)
+            logger.debug("[MEMORIA-CARGA] → mem0 no disponible | %s", exc)
 
-    logger.debug("Memoria cargada para user='%s': %d entradas", user_id, len(memory))
+    logger.info(
+        "[MEMORIA-CARGA] → load_memory_node | completado | entradas=%d mem0=%s",
+        len(memory), "ok" if mem0_ok else "no disponible",
+    )
     return {"user_memory": memory}
 
 
 # ---------------------------------------------------------------------------
-# Nodo: manager_node  (sustituye a router_node)
+# Nodo: manager_node
 # ---------------------------------------------------------------------------
 
 def manager_node(state: AgentState) -> dict:
@@ -163,11 +188,16 @@ def manager_node(state: AgentState) -> dict:
     Devuelve el primer paso como `intent` y los pasos restantes como `execution_plan`.
     Puede encadenar hasta 2 herramientas (e.g. rag → web_search).
     """
-    llm, provider = get_llm()
+    n_msgs = len(state["messages"])
+    user_id = state.get("user_id", "?")
+    logger.info(
+        "[MANAGER] → manager_node | inicio | user='%s' mensajes=%d",
+        user_id, n_msgs,
+    )
 
+    llm, provider = get_llm()
     messages_text = _messages_to_text(state["messages"])
     memory_str = json.dumps(state.get("user_memory", {}), ensure_ascii=False)
-
     prompt = MANAGER_PROMPT.format(user_memory=memory_str, messages=messages_text)
 
     try:
@@ -186,15 +216,15 @@ def manager_node(state: AgentState) -> dict:
             steps = ["plain_llm"]
 
     except Exception as exc:
-        logger.warning("Manager: error al parsear plan (%s) — usando plain_llm", exc)
+        logger.warning("[MANAGER] → manager_node | error al parsear plan | %s → fallback plain_llm", exc)
         steps = ["plain_llm"]
 
     first_step = steps[0]
     remaining = steps[1:]
 
     logger.info(
-        "Manager: plan=%s, proveedor=%s",
-        steps, provider,
+        "[MANAGER] → manager_node | plan=%s proveedor=%s | intent='%s' pasos_restantes=%s",
+        steps, provider, first_step, remaining,
     )
     return {"intent": first_step, "execution_plan": remaining, "llm_provider": provider}
 
@@ -211,8 +241,13 @@ def plan_dispatch_node(state: AgentState) -> dict:
     plan = list(state.get("execution_plan", []))
     if plan:
         next_intent = plan.pop(0)
-        logger.debug("Plan dispatch: siguiente paso='%s', restante=%s", next_intent, plan)
+        logger.info(
+            "[PLAN] → plan_dispatch_node | siguiente='%s' restante=%s",
+            next_intent, plan,
+        )
         return {"intent": next_intent, "execution_plan": plan}
+
+    logger.info("[PLAN] → plan_dispatch_node | plan vacío → plain_llm")
     return {"intent": "plain_llm", "execution_plan": []}
 
 
@@ -224,12 +259,24 @@ def rag_node(state: AgentState) -> dict:
     """Recupera fragmentos relevantes de documentos para el último mensaje."""
     last_human = _last_human(state["messages"])
     if not last_human:
+        logger.warning("[RAG] → rag_node | saltado | sin mensaje humano")
         return {"rag_context": []}
 
     query = last_human.content if isinstance(last_human.content, str) else ""
+    logger.info("[RAG] → rag_node | inicio | query='%.60s'", query)
+
     results = retrieve(query)
     context = [{"content": r.content, "source": r.source, "score": r.score} for r in results]
-    logger.info("RAG: recuperados %d fragmentos para query='%.60s'", len(context), query)
+
+    if context:
+        scores = [c["score"] for c in context]
+        logger.info(
+            "[RAG] → rag_node | completado | fragmentos=%d score_max=%.3f score_min=%.3f",
+            len(context), max(scores), min(scores),
+        )
+    else:
+        logger.info("[RAG] → rag_node | completado | fragmentos=0 (sin resultados sobre el umbral)")
+
     return {"rag_context": context}
 
 
@@ -239,24 +286,31 @@ def rag_node(state: AgentState) -> dict:
 
 def web_search_node(state: AgentState, mcp_tools: list | None = None) -> dict:
     """Ejecuta una búsqueda web de Tavily mediante herramientas MCP."""
+    logger.info(
+        "[WEB-SEARCH] → web_search_node | inicio | herramientas_mcp=%d",
+        len(mcp_tools) if mcp_tools else 0,
+    )
+
     if not mcp_tools:
-        logger.warning("web_search_node: sin herramientas MCP — fallback a plain_llm")
+        logger.warning("[WEB-SEARCH] → web_search_node | sin herramientas MCP → fallback plain_llm")
         return {"intent": "plain_llm"}
 
     tavily_tool = _find_tool_by_keyword(mcp_tools, "search")
     if not tavily_tool:
-        logger.warning("web_search_node: herramienta de búsqueda no encontrada")
+        logger.warning("[WEB-SEARCH] → web_search_node | herramienta 'search' no encontrada → fallback plain_llm")
         return {"intent": "plain_llm"}
 
     last_human = _last_human(state["messages"])
     query = last_human.content if last_human else ""
+    logger.info("[WEB-SEARCH] → web_search_node | ejecutando | tool='%s' query='%.60s'", tavily_tool.name, query)
 
     try:
         result = tavily_tool.invoke({"query": query})
+        logger.info("[WEB-SEARCH] → web_search_node | completado | resultado_len=%d", len(str(result)))
         search_message = AIMessage(content=f"[Resultados de búsqueda web]\n{result}")
         return {"messages": [search_message]}
     except Exception as exc:
-        logger.error("web_search_node: búsqueda Tavily fallida: %s", exc)
+        logger.error("[WEB-SEARCH] → web_search_node | fallido | error=%s", exc)
         return {"error": str(exc)}
 
 
@@ -269,8 +323,15 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
     Inspecciona la acción de Google y prepara tool_calls_pending.
     Se ejecuta DESPUÉS de la interrupción (interrupt_before=["hitl_node"]).
     """
+    user_id = state.get("user_id", "?")
+    logger.info(
+        "[HITL] → hitl_node | inicio | user='%s' herramientas_mcp=%d",
+        user_id, len(mcp_tools) if mcp_tools else 0,
+    )
+
     last_human = _last_human(state["messages"])
     if not last_human or not mcp_tools:
+        logger.warning("[HITL] → hitl_node | sin mensaje o herramientas → aprobación denegada")
         return {"hitl_approved": False}
 
     google_tools = [
@@ -278,8 +339,10 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
         if any(kw in t.name.lower() for kw in ("google", "calendar", "gmail", "drive", "event", "email"))
     ]
     if not google_tools:
+        logger.info("[HITL] → hitl_node | sin herramientas Google → fallback plain_llm")
         return {"hitl_approved": False, "intent": "plain_llm"}
 
+    logger.info("[HITL] → hitl_node | herramientas_google=%d | invocando LLM para detectar acciones", len(google_tools))
     llm_with_tools, _ = get_llm(tools=google_tools)
     response = llm_with_tools.invoke(list(state["messages"]))
 
@@ -289,6 +352,11 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
         for tc in tool_calls
         if tc["name"] in _HITL_DESTRUCTIVE_ACTIONS
     ]
+
+    logger.info(
+        "[HITL] → hitl_node | completado | acciones_destructivas=%d | %s",
+        len(pending), [p["name"] for p in pending],
+    )
     return {"tool_calls_pending": pending, "messages": [response]}
 
 
@@ -299,25 +367,34 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
 def google_action_node(state: AgentState, mcp_tools: list | None = None) -> dict:
     """Ejecuta las llamadas aprobadas a herramientas de Google Workspace."""
     pending = state.get("tool_calls_pending", [])
+    logger.info(
+        "[GOOGLE] → google_action_node | inicio | acciones_aprobadas=%d",
+        len(pending),
+    )
+
     if not pending or not mcp_tools:
+        logger.warning("[GOOGLE] → google_action_node | sin acciones o herramientas → sin efecto")
         return {}
 
-    tool_map = {t.name: t for t in mcp_tools}
     result_messages: list = []
+    ejecutadas = 0
 
     for call in pending:
         tool = _find_tool(mcp_tools, call["name"])
         if not tool:
-            logger.warning("google_action_node: herramienta '%s' no encontrada", call["name"])
+            logger.warning("[GOOGLE] → google_action_node | herramienta '%s' no encontrada", call["name"])
             continue
         try:
+            logger.info("[GOOGLE] → google_action_node | ejecutando | tool='%s' args=%s", call["name"], call["args"])
             result = tool.invoke(call["args"])
             result_messages.append(ToolMessage(content=str(result), tool_call_id=call["name"]))
-            logger.info("google_action_node: ejecutada '%s'", call["name"])
+            ejecutadas += 1
+            logger.info("[GOOGLE] → google_action_node | tool='%s' → completado", call["name"])
         except Exception as exc:
-            logger.error("google_action_node: '%s' falló: %s", call["name"], exc)
+            logger.error("[GOOGLE] → google_action_node | tool='%s' → fallido | error=%s", call["name"], exc)
             result_messages.append(ToolMessage(content=f"Error: {exc}", tool_call_id=call["name"]))
 
+    logger.info("[GOOGLE] → google_action_node | completado | ejecutadas=%d/%d", ejecutadas, len(pending))
     return {"messages": result_messages, "tool_calls_pending": []}
 
 
@@ -330,10 +407,19 @@ def llm_node(state: AgentState) -> dict:
     Genera la respuesta final del asistente incorporando contexto RAG,
     resultados de herramientas y memoria del usuario.
     """
+    user_id = state.get("user_id", "?")
+    rag_context = state.get("rag_context", [])
+    guardrail_ok = state.get("guardrail_passed")
+
+    logger.info(
+        "[LLM] → llm_node | inicio | user='%s' rag_ctx=%d guardrail=%s hitl_aprobado=%s",
+        user_id, len(rag_context), guardrail_ok, state.get("hitl_approved"),
+    )
+
     # Rechazar si el guardrail bloqueó la entrada
-    if state.get("guardrail_passed") is False:
+    if guardrail_ok is False:
         violations = state.get("guardrail_violations", [])
-        logger.warning("llm_node: respuesta bloqueada por guardrails: %s", violations)
+        logger.warning("[LLM] → llm_node | RECHAZADO por guardrail | violaciones=%s", violations)
         rejection = (
             "Lo siento, no puedo procesar esa solicitud. Se han detectado "
             "patrones de seguridad que impiden continuar. Por favor, reformula tu mensaje."
@@ -344,19 +430,28 @@ def llm_node(state: AgentState) -> dict:
     memory_str = json.dumps(state.get("user_memory", {}), ensure_ascii=False, indent=2)
     system_content = SYSTEM_PROMPT.format(user_memory=memory_str)
 
-    rag_context = state.get("rag_context", [])
     if rag_context:
         context_str = "\n\n".join(
             f"[{i+1}] (fuente: {c['source']}, puntuación: {c['score']:.2f})\n{c['content']}"
             for i, c in enumerate(rag_context)
         )
         system_content += "\n\n" + RAG_SYSTEM_PROMPT.format(rag_context=context_str)
+        logger.debug("[LLM] → llm_node | contexto RAG inyectado | fragmentos=%d", len(rag_context))
 
     if state.get("hitl_approved") is False and state.get("tool_calls_pending"):
         system_content += "\n\nEl usuario ha rechazado la acción de Google solicitada. Acéptalo con amabilidad."
+        logger.info("[LLM] → llm_node | acción HITL rechazada por el usuario")
 
     messages = [SystemMessage(content=system_content)] + list(state["messages"])
+    logger.debug("[LLM] → llm_node | invocando LLM | proveedor=%s mensajes_totales=%d", provider, len(messages))
+
     response = llm.invoke(messages)
+    response_len = len(response.content) if isinstance(response.content, str) else 0
+
+    logger.info(
+        "[LLM] → llm_node | completado | proveedor=%s respuesta_len=%d",
+        provider, response_len,
+    )
     return {"messages": [response], "llm_provider": provider}
 
 
@@ -367,6 +462,7 @@ def llm_node(state: AgentState) -> dict:
 def output_guardrail_node(state: AgentState) -> dict:
     """Sanea la última respuesta del asistente antes de entregarla."""
     if not get_settings().guardrails_enabled:
+        logger.debug("[GUARDRAIL-OUT] → output_guardrail_node | saltado | guardrails desactivados")
         return {}
 
     messages = state.get("messages", [])
@@ -378,15 +474,18 @@ def output_guardrail_node(state: AgentState) -> dict:
         return {}
 
     text = last_msg.content if isinstance(last_msg.content, str) else ""
+    logger.info("[GUARDRAIL-OUT] → output_guardrail_node | inicio | msg_len=%d", len(text))
+
     result = _get_output_guard().check(text)
 
     if result.sanitized_text != text:
         logger.info(
-            "Guardrail de salida: redacciones=%s violaciones=%s",
+            "[GUARDRAIL-OUT] → output_guardrail_node | REDACTADO | redacciones=%s violaciones=%s",
             result.redactions, result.violations,
         )
         return {"messages": [AIMessage(content=result.sanitized_text)]}
 
+    logger.info("[GUARDRAIL-OUT] → output_guardrail_node | completado | sin redacciones")
     return {}
 
 
@@ -401,9 +500,14 @@ def save_memory_node(state: AgentState) -> dict:
       2. Chroma      → hechos semánticos a largo plazo
       3. mem0        → memoria conversacional contextual
     """
-    llm, _ = get_llm()
     user_id = state.get("user_id", "default")
     thread_id = state.get("thread_id", "")
+    logger.info(
+        "[MEMORIA-GUARDA] → save_memory_node | inicio | user='%s' thread='%s'",
+        user_id, thread_id,
+    )
+
+    llm, _ = get_llm()
 
     # Capa 1 + 2: extraer preferencias y almacenar en SQLite + Chroma
     updates = extract_memory_updates(list(state["messages"]), llm)
@@ -413,10 +517,16 @@ def save_memory_node(state: AgentState) -> dict:
             try:
                 store_long_term_fact(user_id, f"{key}: {value}", source="memory_extraction")
             except Exception as exc:
-                logger.debug("Error almacenando hecho a largo plazo: %s", exc)
-        logger.info("Guardadas %d actualizaciones de memoria para user='%s'", len(updates), user_id)
+                logger.debug("[MEMORIA-GUARDA] → store_long_term_fact | error (no crítico) | %s", exc)
+        logger.info(
+            "[MEMORIA-GUARDA] → save_memory_node | SQLite+Chroma | actualizaciones=%d claves=%s",
+            len(updates), list(updates.keys()),
+        )
+    else:
+        logger.debug("[MEMORIA-GUARDA] → save_memory_node | sin actualizaciones de memoria")
 
     # Capa 3: registrar en mem0
+    mem0_ok = False
     try:
         from aetheris.memory.mem0_memory import add_conversation_memory
         recent_msgs = [
@@ -429,7 +539,12 @@ def save_memory_node(state: AgentState) -> dict:
         ]
         if recent_msgs:
             add_conversation_memory(recent_msgs, user_id, session_id=thread_id)
+            mem0_ok = True
     except Exception as exc:
-        logger.debug("mem0 no disponible para guardar: %s", exc)
+        logger.debug("[MEMORIA-GUARDA] → mem0 no disponible | %s", exc)
 
+    logger.info(
+        "[MEMORIA-GUARDA] → save_memory_node | completado | user='%s' mem0=%s",
+        user_id, "ok" if mem0_ok else "no disponible",
+    )
     return {}

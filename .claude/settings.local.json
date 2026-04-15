@@ -43,7 +43,8 @@
       "Bash(python -m streamlit run aetheris/ui/app.py --server.port 8501 --server.headless true)",
       "Bash(python _test_full_flow.py)",
       "Bash(python -m pytest tests/ --co -q)",
-      "Bash(pip show:*)"
+      "Bash(pip show:*)",
+      "Bash(python -c \"from aetheris.logging_config import setup_logging; from aetheris.agent.nodes import input_guardrail_node, manager_node, llm_node; from aetheris.api.routers.chat import router; from aetheris.rag.ingest import ingest_file; from aetheris.mcp.client import get_mcp_tools; print\\('OK — todos los módulos importan correctamente'\\)\")"
     ]
   }
 }

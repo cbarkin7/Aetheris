@@ -26,7 +26,8 @@ async def create_async_checkpointer(db_path: str | None = None):
     path = db_path or settings.sqlite_checkpoints_path
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
+    logger.info("[CHECKPOINTER] → create_async_checkpointer | inicio | path='%s'", path)
     conn = await aiosqlite.connect(path)
     checkpointer = AsyncSqliteSaver(conn)
-    logger.info("AsyncSqliteSaver checkpointer initialized at '%s'", path)
+    logger.info("[CHECKPOINTER] → create_async_checkpointer | completado | AsyncSqliteSaver listo")
     return checkpointer

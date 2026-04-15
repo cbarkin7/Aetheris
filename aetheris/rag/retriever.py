@@ -66,6 +66,11 @@ def retrieve(
     effective_k = k or settings.rag_retrieval_k
     vectorstore = get_vectorstore(collection_name=collection_name, embeddings=embeddings)
 
+    logger.info(
+        "[RAG][RETRIEVE] → retrieve | inicio | query='%.55s' k=%d colección='%s'",
+        query, effective_k, collection_name,
+    )
+
     results = vectorstore.similarity_search_with_relevance_scores(query, k=effective_k)
 
     filtered = [
@@ -81,13 +86,17 @@ def retrieve(
         if score >= settings.rag_score_threshold
     ]
 
-    logger.info(
-        "Retrieved %d/%d chunks above threshold %.2f for query: '%s...'",
-        len(filtered),
-        len(results),
-        settings.rag_score_threshold,
-        query[:60],
-    )
+    if filtered:
+        scores = [r.score for r in filtered]
+        logger.info(
+            "[RAG][RETRIEVE] → retrieve | completado | %d/%d fragmentos | umbral=%.2f score_max=%.3f score_min=%.3f",
+            len(filtered), len(results), settings.rag_score_threshold, max(scores), min(scores),
+        )
+    else:
+        logger.info(
+            "[RAG][RETRIEVE] → retrieve | completado | 0/%d fragmentos sobre umbral=%.2f",
+            len(results), settings.rag_score_threshold,
+        )
     return filtered
 
 
