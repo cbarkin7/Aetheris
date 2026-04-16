@@ -12,17 +12,41 @@ from aetheris.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _make_client(settings=None):
+    """Instancia el cliente LangSmith usando el endpoint y la clave de Settings."""
+    from langsmith import Client
+    s = settings or get_settings()
+    return Client(api_key=s.langsmith_api_key, api_url=s.langsmith_endpoint)
+
+
 def configure_langsmith() -> None:
     """Set LangSmith environment variables from Settings (idempotent)."""
     settings = get_settings()
-    if settings.langsmith_api_key:
-        os.environ.setdefault("LANGCHAIN_TRACING_V2", str(settings.langchain_tracing_v2).lower())
-        os.environ.setdefault("LANGSMITH_API_KEY", settings.langsmith_api_key)
-        os.environ.setdefault("LANGSMITH_PROJECT", settings.langsmith_project)
-        os.environ.setdefault("LANGCHAIN_PROJECT", settings.langsmith_project)
-        logger.info("LangSmith tracing configured for project '%s'", settings.langsmith_project)
-    else:
+    if not settings.langsmith_api_key:
         logger.warning("LANGSMITH_API_KEY not set — tracing disabled")
+        return
+
+    # Se propagan el endpoint, la clave y el proyecto como variables de entorno
+    # para que LangChain/LangGraph los recojan en todas las invocaciones al LLM.
+    os.environ.setdefault("LANGCHAIN_TRACING_V2", str(settings.langchain_tracing_v2).lower())
+    os.environ.setdefault("LANGSMITH_API_KEY", settings.langsmith_api_key)
+    os.environ.setdefault("LANGSMITH_ENDPOINT", settings.langsmith_endpoint)
+    os.environ.setdefault("LANGSMITH_PROJECT", settings.langsmith_project)
+    os.environ.setdefault("LANGCHAIN_PROJECT", settings.langsmith_project)
+
+    # Validación temprana con el endpoint correcto: si la llamada de prueba falla
+    # (clave expirada, 403, proyecto incorrecto) se desactiva el tracing antes de
+    # que el agente empiece a operar, evitando spam de WARNING en cada llamada al LLM.
+    try:
+        client = _make_client(settings)
+        client.read_project(project_name=settings.langsmith_project)
+        logger.info(
+            "LangSmith tracing activo | endpoint='%s' project='%s'",
+            settings.langsmith_endpoint, settings.langsmith_project,
+        )
+    except Exception as exc:
+        logger.warning("LangSmith no disponible — tracing desactivado | causa: %s", exc)
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
 
 def get_langsmith_client():
@@ -31,8 +55,7 @@ def get_langsmith_client():
     if not settings.langsmith_api_key:
         return None
     try:
-        from langsmith import Client
-        return Client(api_key=settings.langsmith_api_key)
+        return _make_client(settings)
     except Exception as exc:
         logger.error("Failed to create LangSmith client: %s", exc)
         return None

@@ -126,7 +126,19 @@ def search_memory(
     """
     client = get_mem0_client()
     try:
-        results = client.search(query=query, user_id=user_id, limit=limit)
+        # La API v2 de mem0 cloud (MemoryClient) exige el parámetro `filters` explícito;
+        # pasar solo `user_id` produce 400 "Filters are required and cannot be empty".
+        # En modo local (Memory) el cliente acepta `user_id` directamente como argumento.
+        settings = get_settings()
+        if settings.mem0_cloud_mode:
+            results = client.search(
+                query=query,
+                filters={"AND": [{"user_id": user_id}]},
+                limit=limit,
+            )
+        else:
+            results = client.search(query=query, user_id=user_id, limit=limit)
+
         # mem0 cloud devuelve lista directamente; local puede devolver dict
         if isinstance(results, dict):
             return results.get("results", [])

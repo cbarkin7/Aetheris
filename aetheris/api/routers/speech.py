@@ -38,6 +38,13 @@ def _get_whisper_model():
             "Cargando modelo faster-whisper '%s' (device=%s, compute=%s)…",
             s.whisper_model_size, s.whisper_device, s.whisper_compute_type,
         )
+        # Se inyecta HF_TOKEN en el entorno antes de instanciar WhisperModel para que
+        # huggingface_hub lo use al descargar el modelo y elimine el WARNING de rate-limiting.
+        # El token requiere permisos READ (solo lectura sobre repos públicos).
+        import os
+        if s.hf_token:
+            os.environ.setdefault("HF_TOKEN", s.hf_token)
+
         _whisper_model = WhisperModel(
             s.whisper_model_size,
             device=s.whisper_device,

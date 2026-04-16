@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
+    # HuggingFace Hub (descarga de modelos)
+    # -------------------------------------------------------------------------
+    hf_token: str = Field(default="", description="Token HuggingFace (Read) para evitar rate-limiting al descargar modelos")
+
+    # -------------------------------------------------------------------------
     # Speech-to-Text local (faster-whisper, sin coste de API)
     # Tamaños disponibles: tiny, base, small, medium, large-v2, large-v3
     # -------------------------------------------------------------------------
@@ -57,6 +62,10 @@ class Settings(BaseSettings):
     langchain_tracing_v2: bool = Field(default=True)
     langsmith_api_key: str = Field(default="", description="Clave API de LangSmith")
     langsmith_project: str = Field(default="aetheris")
+    langsmith_endpoint: str = Field(
+        default="https://eu.api.smith.langchain.com",
+        description="Endpoint de LangSmith (usar https://eu.api.smith.langchain.com para la región EU)",
+    )
 
     # -------------------------------------------------------------------------
     # Servicios externos (MCP)
