@@ -146,6 +146,7 @@ def base_agent_state():
         "rag_context": [],
         "tool_calls_pending": [],
         "hitl_approved": None,
+        "action_results": [],
         "user_memory": {},
         "guardrail_passed": None,
         "guardrail_violations": [],

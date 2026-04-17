@@ -36,12 +36,19 @@ logger = logging.getLogger(__name__)
 _VALID_INTENTS = frozenset({"rag", "web_search", "google_action", "plain_llm"})
 
 _HITL_DESTRUCTIVE_ACTIONS = frozenset({
-    "create_calendar_event",
-    "send_email",
-    "delete_file",
-    "move_file",
+    # --- @cocal/google-calendar-mcp ---
+    "create_event",
     "update_event",
     "delete_event",
+    "create_calendar_event",   # alias por compatibilidad
+    # --- @gongrzhe/server-gmail-autoauth-mcp ---
+    "send_email",
+    "send_gmail",
+    "reply_to_email",
+    "create_draft",
+    # --- Drive (futuro) ---
+    "delete_file",
+    "move_file",
 })
 
 # Singletons de guardrails (inicialización perezosa)
@@ -320,8 +327,9 @@ def web_search_node(state: AgentState, mcp_tools: list | None = None) -> dict:
 
 def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
     """
-    Inspecciona la acción de Google y prepara tool_calls_pending.
-    Se ejecuta DESPUÉS de la interrupción (interrupt_before=["hitl_node"]).
+    Prepara tool_calls_pending con descripción legible de cada acción destructiva.
+    El grafo pausa con interrupt_after DESPUÉS de este nodo: on_chain_end llega
+    al SSE y el frontend muestra el modal de confirmación con las descripciones.
     """
     user_id = state.get("user_id", "?")
     logger.info(
@@ -331,30 +339,57 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
 
     last_human = _last_human(state["messages"])
     if not last_human or not mcp_tools:
-        logger.warning("[HITL] → hitl_node | sin mensaje o herramientas → aprobación denegada")
-        return {"hitl_approved": False}
+        logger.warning("[HITL] → hitl_node | sin mensaje o herramientas → informando al usuario")
+        return {
+            "hitl_approved": False,
+            "intent": "plain_llm",
+            "messages": [AIMessage(
+                content="⚠️ Las herramientas de Google Workspace no están disponibles en este momento. "
+                        "Verifica que los servidores MCP estén configurados correctamente."
+            )],
+        }
 
     google_tools = [
         t for t in mcp_tools
         if any(kw in t.name.lower() for kw in ("google", "calendar", "gmail", "drive", "event", "email"))
     ]
     if not google_tools:
-        logger.info("[HITL] → hitl_node | sin herramientas Google → fallback plain_llm")
-        return {"hitl_approved": False, "intent": "plain_llm"}
+        logger.info("[HITL] → hitl_node | sin herramientas Google → informando al usuario")
+        return {
+            "hitl_approved": False,
+            "intent": "plain_llm",
+            "messages": [AIMessage(
+                content="⚠️ No se encontraron herramientas de Google Workspace activas. "
+                        "Comprueba las credenciales OAuth en la configuración."
+            )],
+        }
 
-    logger.info("[HITL] → hitl_node | herramientas_google=%d | invocando LLM para detectar acciones", len(google_tools))
+    # Invocar LLM con las herramientas para detectar qué acciones quiere ejecutar
+    logger.info("[HITL] → hitl_node | herramientas_google=%d | detectando acciones", len(google_tools))
     llm_with_tools, _ = get_llm(tools=google_tools)
     response = llm_with_tools.invoke(list(state["messages"]))
-
     tool_calls = getattr(response, "tool_calls", []) or []
-    pending = [
-        {"name": tc["name"], "args": tc["args"]}
-        for tc in tool_calls
-        if tc["name"] in _HITL_DESTRUCTIVE_ACTIONS
-    ]
+
+    # Para cada acción destructiva, generar descripción legible con HITL_DESCRIPTION_PROMPT
+    llm, _ = get_llm()
+    pending = []
+    for tc in tool_calls:
+        if tc["name"] not in _HITL_DESTRUCTIVE_ACTIONS:
+            continue
+        desc_prompt = HITL_DESCRIPTION_PROMPT.format(
+            tool_name=tc["name"],
+            tool_args=json.dumps(tc["args"], ensure_ascii=False),
+        )
+        try:
+            description = llm.invoke([HumanMessage(content=desc_prompt)]).content.strip()
+        except Exception as exc:
+            logger.debug("[HITL] → hitl_node | descripción fallback | %s", exc)
+            description = f"{tc['name']}: {json.dumps(tc['args'], ensure_ascii=False)}"
+
+        pending.append({"name": tc["name"], "args": tc["args"], "description": description})
 
     logger.info(
-        "[HITL] → hitl_node | completado | acciones_destructivas=%d | %s",
+        "[HITL] → hitl_node | completado | acciones_pendientes=%d | %s",
         len(pending), [p["name"] for p in pending],
     )
     return {"tool_calls_pending": pending, "messages": [response]}
@@ -365,7 +400,11 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 def google_action_node(state: AgentState, mcp_tools: list | None = None) -> dict:
-    """Ejecuta las llamadas aprobadas a herramientas de Google Workspace."""
+    """
+    Ejecuta las llamadas aprobadas a herramientas de Google Workspace.
+    Registra cada resultado en action_results para que el SSE emita feedback
+    inmediato por acción (éxito o fallo) antes de que llm_node genere el resumen.
+    """
     pending = state.get("tool_calls_pending", [])
     logger.info(
         "[GOOGLE] → google_action_node | inicio | acciones_aprobadas=%d",
@@ -374,28 +413,44 @@ def google_action_node(state: AgentState, mcp_tools: list | None = None) -> dict
 
     if not pending or not mcp_tools:
         logger.warning("[GOOGLE] → google_action_node | sin acciones o herramientas → sin efecto")
-        return {}
+        return {"action_results": []}
 
     result_messages: list = []
-    ejecutadas = 0
+    action_results: list[dict] = []
 
     for call in pending:
         tool = _find_tool(mcp_tools, call["name"])
         if not tool:
             logger.warning("[GOOGLE] → google_action_node | herramienta '%s' no encontrada", call["name"])
+            action_results.append({
+                "ok": False,
+                "name": call["name"],
+                "error": f"Herramienta '{call['name']}' no encontrada en el servidor MCP",
+            })
+            result_messages.append(
+                ToolMessage(content=f"Error: herramienta '{call['name']}' no disponible", tool_call_id=call["name"])
+            )
             continue
+
         try:
-            logger.info("[GOOGLE] → google_action_node | ejecutando | tool='%s' args=%s", call["name"], call["args"])
+            logger.info("[GOOGLE] → google_action_node | ejecutando | tool='%s'", call["name"])
             result = tool.invoke(call["args"])
+            summary = str(result)[:300]
             result_messages.append(ToolMessage(content=str(result), tool_call_id=call["name"]))
-            ejecutadas += 1
+            action_results.append({"ok": True, "name": call["name"], "summary": summary})
             logger.info("[GOOGLE] → google_action_node | tool='%s' → completado", call["name"])
         except Exception as exc:
-            logger.error("[GOOGLE] → google_action_node | tool='%s' → fallido | error=%s", call["name"], exc)
-            result_messages.append(ToolMessage(content=f"Error: {exc}", tool_call_id=call["name"]))
+            error_msg = str(exc)
+            logger.error("[GOOGLE] → google_action_node | tool='%s' → fallido | %s", call["name"], error_msg)
+            result_messages.append(ToolMessage(content=f"Error: {error_msg}", tool_call_id=call["name"]))
+            action_results.append({"ok": False, "name": call["name"], "error": error_msg})
 
-    logger.info("[GOOGLE] → google_action_node | completado | ejecutadas=%d/%d", ejecutadas, len(pending))
-    return {"messages": result_messages, "tool_calls_pending": []}
+    ok_count = sum(1 for r in action_results if r["ok"])
+    logger.info(
+        "[GOOGLE] → google_action_node | completado | ok=%d/%d",
+        ok_count, len(pending),
+    )
+    return {"messages": result_messages, "tool_calls_pending": [], "action_results": action_results}
 
 
 # ---------------------------------------------------------------------------

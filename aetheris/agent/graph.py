@@ -128,9 +128,14 @@ def build_graph(mcp_tools: list | None = None, checkpointer=None) -> CompiledSta
     builder.add_edge("output_guardrail_node", "save_memory_node")
     builder.add_edge("save_memory_node", END)
 
+    # interrupt_after: hitl_node se ejecuta completo (popula tool_calls_pending
+    # y genera las descripciones) y el grafo pausa DESPUÉS. Así on_chain_end
+    # de hitl_node llega al SSE y el frontend recibe el evento hitl_required
+    # con las acciones a confirmar. Al reanudar, LangGraph evalúa route_after_hitl
+    # con hitl_approved ya fijado por aupdate_state — sin re-ejecutar hitl_node.
     graph = builder.compile(
         checkpointer=checkpointer,
-        interrupt_before=["hitl_node"],
+        interrupt_after=["hitl_node"],
     )
 
     logger.info("Grafo AETHERIS compilado (herramientas MCP: %d)", len(tools))

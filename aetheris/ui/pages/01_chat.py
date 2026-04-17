@@ -155,28 +155,74 @@ def _send_message(prompt: str) -> None:
 if st.session_state.hitl_pending:
     approval = render_hitl_modal(st.session_state.hitl_pending)
     if approval is not None:
-        resp = requests.post(
-            f"{API_BASE}/api/v1/chat/{st.session_state.thread_id}/resume",
-            json={"approved": approval, "user_id": st.session_state.user_id},
-            stream=True,
-            timeout=60,
-        )
         st.session_state.hitl_pending = None
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            full_response = ""
-            for line in resp.iter_lines():
-                if line and line.startswith(b"data: "):
+
+        try:
+            resp = requests.post(
+                f"{API_BASE}/api/v1/chat/{st.session_state.thread_id}/resume",
+                json={"approved": approval, "user_id": st.session_state.user_id},
+                stream=True,
+                timeout=60,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            st.error(f"No se pudo reanudar la conversación: {exc}")
+            st.rerun()
+        else:
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                full_response = ""
+                action_feedback: list[str] = []
+
+                for line in resp.iter_lines():
+                    if not line or not line.startswith(b"data: "):
+                        continue
                     event = json.loads(line[6:])
-                    if event.get("type") == "token":
+                    etype = event.get("type")
+
+                    if etype == "action_result":
+                        # Acción ejecutada correctamente — feedback inmediato
+                        name = event.get("name", "")
+                        summary = event.get("summary", "")
+                        msg = f"✅ **{name}** ejecutado correctamente."
+                        if summary:
+                            msg += f"\n> {summary[:200]}"
+                        action_feedback.append(msg)
+                        placeholder.markdown("\n\n".join(action_feedback) + "\n\n_Generando resumen…_ ⏳")
+
+                    elif etype == "action_error":
+                        # Acción fallida — mostrar cuál y continuar con el resto
+                        name = event.get("name", "")
+                        error = event.get("error", "Error desconocido")
+                        action_feedback.append(f"❌ **{name}** ha fallado: {error}")
+                        placeholder.markdown("\n\n".join(action_feedback) + "\n\n_Continuando…_ ⏳")
+
+                    elif etype == "token":
                         full_response += event["content"]
-                        placeholder.markdown(full_response + "▌")
-                    elif event.get("type") == "done":
-                        placeholder.markdown(full_response)
+                        prefix = "\n\n".join(action_feedback) + "\n\n---\n" if action_feedback else ""
+                        placeholder.markdown(prefix + full_response + "▌")
+
+                    elif etype == "done":
+                        prefix = "\n\n".join(action_feedback) + "\n\n---\n" if action_feedback else ""
+                        placeholder.markdown(prefix + full_response)
                         break
-        if full_response:
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
-        st.rerun()
+
+                    elif etype == "error":
+                        st.error(f"Error durante la ejecución: {event.get('message', '')}")
+                        # El chat queda disponible para el siguiente mensaje
+                        break
+
+            # Guardar en historial todo lo mostrado (feedback de acciones + resumen LLM)
+            combined_parts = action_feedback[:]
+            if full_response:
+                combined_parts.append(full_response)
+            if combined_parts:
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": "\n\n".join(combined_parts),
+                })
+
+            st.rerun()
 
 # ---------------------------------------------------------------------------
 # Historial de conversación

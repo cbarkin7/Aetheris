@@ -6,6 +6,7 @@
 data/chroma_db/
 data/sqlite/
 data/uploads/
+data/google/           # ficheros JSON de credenciales OAuth (contienen secrets)
 
 # Python
 __pycache__/

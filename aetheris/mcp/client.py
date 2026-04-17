@@ -1,12 +1,21 @@
 """
 MCP client — bridges LangChain agents to external MCP servers.
 MultiServerMCPClient is started once at FastAPI lifespan and stored in app.state.
+
+Servidores disponibles:
+  - tavily   → búsqueda web en tiempo real (@modelcontextprotocol/server-tavily)
+  - calendar → Google Calendar (@cocal/google-calendar-mcp)
+  - gmail    → Gmail (@gongrzhe/server-gmail-autoauth-mcp)
 """
 import logging
 from typing import Any
 
 from aetheris.config import get_settings
-from aetheris.mcp.google_tools import get_google_server_config
+from aetheris.mcp.google_tools import (
+    calendar_server_config,
+    ensure_google_credentials_files,
+    gmail_server_config,
+)
 from aetheris.mcp.tavily_tools import get_tavily_server_config
 
 logger = logging.getLogger(__name__)
@@ -52,9 +61,13 @@ async def get_mcp_tools(include_tavily: bool = True, include_google: bool = True
     """
     Inicia los servidores MCP configurados y devuelve la lista plana de herramientas.
 
-    Cada servidor se conecta de forma independiente para que un fallo aislado
-    (npx no instalado, credenciales inválidas, timeout) no impida cargar los
-    demás servidores disponibles.
+    Servidores registrados de forma independiente:
+      - tavily    → requiere TAVILY_API_KEY
+      - calendar  → requiere GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + GOOGLE_REFRESH_TOKEN
+      - gmail     → requiere las mismas credenciales Google
+
+    Si las credenciales Google están presentes, ensure_google_credentials_files()
+    escribe los ficheros JSON necesarios para los servidores MCP antes de iniciarlos.
     """
     logger.info(
         "[MCP] → get_mcp_tools | inicio | tavily=%s google=%s",
@@ -70,23 +83,47 @@ async def get_mcp_tools(include_tavily: bool = True, include_google: bool = True
     settings = get_settings()
     servers: dict[str, dict] = {}
 
+    # -- Tavily ----------------------------------------------------------------
     if include_tavily and settings.tavily_api_key:
         servers["tavily"] = get_tavily_server_config()
         logger.debug("[MCP] → get_mcp_tools | servidor Tavily configurado")
     else:
         logger.info("[MCP] → get_mcp_tools | Tavily omitido (sin API key o desactivado)")
 
-    if include_google and settings.google_client_id and settings.google_refresh_token:
-        servers["google"] = get_google_server_config()
-        logger.debug("[MCP] → get_mcp_tools | servidor Google configurado")
+    # -- Google Calendar + Gmail -----------------------------------------------
+    google_available = bool(
+        settings.google_client_id
+        and settings.google_client_secret
+        and settings.google_refresh_token
+    )
+
+    if include_google and google_available:
+        # Escribe los ficheros JSON de credenciales a partir de las env vars.
+        # Si ya existen y son válidos, simplemente los sobreescribe con los valores actuales.
+        creds_ok = ensure_google_credentials_files()
+        if creds_ok:
+            servers["calendar"] = calendar_server_config()
+            servers["gmail"] = gmail_server_config()
+            logger.debug("[MCP] → get_mcp_tools | servidores Calendar y Gmail configurados")
+        else:
+            logger.warning(
+                "[MCP] → get_mcp_tools | Google omitido "
+                "(no se pudieron crear los ficheros de credenciales)"
+            )
     else:
-        logger.info("[MCP] → get_mcp_tools | Google omitido (sin credenciales o desactivado)")
+        logger.info(
+            "[MCP] → get_mcp_tools | Google omitido "
+            "(sin GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN)"
+        )
 
     if not servers:
         logger.warning("[MCP] → get_mcp_tools | sin servidores configurados → agente sin herramientas externas")
         return []
 
-    logger.info("[MCP] → get_mcp_tools | servidores=%s | iniciando conexión independiente por servidor", list(servers.keys()))
+    logger.info(
+        "[MCP] → get_mcp_tools | servidores=%s | iniciando conexión independiente por servidor",
+        list(servers.keys()),
+    )
 
     # Cada servidor se conecta por separado: un fallo no cancela los demás.
     all_tools: list[Any] = []
@@ -121,8 +158,17 @@ async def get_mcp_tools_persistent(
 
     if include_tavily and settings.tavily_api_key:
         servers["tavily"] = get_tavily_server_config()
-    if include_google and settings.google_client_id and settings.google_refresh_token:
-        servers["google"] = get_google_server_config()
+
+    google_available = bool(
+        settings.google_client_id
+        and settings.google_client_secret
+        and settings.google_refresh_token
+    )
+    if include_google and google_available:
+        creds_ok = ensure_google_credentials_files()
+        if creds_ok:
+            servers["calendar"] = calendar_server_config()
+            servers["gmail"] = gmail_server_config()
 
     if not servers:
         return None, []

@@ -71,9 +71,22 @@ class Settings(BaseSettings):
     # Servicios externos (MCP)
     # -------------------------------------------------------------------------
     tavily_api_key: str = Field(default="", description="Clave API de Tavily Search")
-    google_client_id: str = Field(default="")
-    google_client_secret: str = Field(default="")
-    google_refresh_token: str = Field(default="")
+
+    # Google OAuth2
+    # google_client_secret_file apunta al JSON descargado de Google Cloud Console (tipo Desktop app).
+    # Si el fichero existe, se usa directamente como GOOGLE_OAUTH_CREDENTIALS para los servidores MCP.
+    # client_id y client_secret se leen del fichero; los campos individuales son opcionales.
+    google_client_secret_file: str = Field(
+        default="data/google/client_secret_aetheris.json",
+        description="Ruta al fichero client_secret_*.json descargado de Google Cloud Console",
+    )
+    google_client_id: str = Field(default="", description="OAuth2 Client ID (fallback si no hay fichero)")
+    google_client_secret: str = Field(default="", description="OAuth2 Client Secret (fallback)")
+    google_refresh_token: str = Field(default="", description="Refresh token obtenido tras el flujo OAuth")
+    google_credentials_dir: str = Field(
+        default="data/google",
+        description="Directorio donde se escriben los ficheros de token authorized_user",
+    )
 
     # -------------------------------------------------------------------------
     # Mem0 (memoria conversacional)

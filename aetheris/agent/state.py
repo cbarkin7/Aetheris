@@ -26,10 +26,15 @@ class AgentState(TypedDict):
     rag_context: list[dict]
 
     # Llamadas a herramientas MCP pendientes de aprobación HITL
+    # Cada elemento: {name, args, description}
     tool_calls_pending: list[dict]
 
     # None = aún no preguntado | True = aprobado | False = rechazado
     hitl_approved: bool | None
+
+    # Resultados de las acciones ejecutadas en google_action_node
+    # Cada elemento: {ok: bool, name: str, summary?: str, error?: str}
+    action_results: list[dict]
 
     # Preferencias del usuario cargadas desde memoria a largo plazo
     user_memory: dict

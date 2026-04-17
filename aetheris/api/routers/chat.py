@@ -51,8 +51,8 @@ async def _stream_graph(graph, input_data: dict | None, config: dict) -> AsyncGe
                     yield f"data: {data}\n\n"
 
             elif kind == "on_chain_end" and event.get("name") == "hitl_node":
-                state = event["data"].get("output", {})
-                pending = state.get("tool_calls_pending", [])
+                output = event["data"].get("output", {})
+                pending = output.get("tool_calls_pending", [])
                 if pending:
                     acciones = [p["name"] for p in pending]
                     logger.info(
@@ -62,6 +62,24 @@ async def _stream_graph(graph, input_data: dict | None, config: dict) -> AsyncGe
                     data = json.dumps({"type": "hitl_required", "actions": pending})
                     yield f"data: {data}\n\n"
                     return
+
+            elif kind == "on_chain_end" and event.get("name") == "google_action_node":
+                # Emitir feedback inmediato por cada acción ejecutada (antes del resumen LLM)
+                output = event["data"].get("output", {})
+                for result in output.get("action_results", []):
+                    if result.get("ok"):
+                        data = json.dumps({
+                            "type": "action_result",
+                            "name": result["name"],
+                            "summary": result.get("summary", ""),
+                        })
+                    else:
+                        data = json.dumps({
+                            "type": "action_error",
+                            "name": result["name"],
+                            "error": result.get("error", "Error desconocido"),
+                        })
+                    yield f"data: {data}\n\n"
 
             elif kind == "on_chain_end" and event.get("name") == "input_guardrail_node":
                 state = event["data"].get("output", {})
@@ -141,6 +159,17 @@ async def resume_after_hitl(
     callbacks = get_langsmith_callbacks()
 
     config = _build_config(thread_id, body.user_id, callbacks)
+
+    # Validar que el hilo tiene un checkpoint con pasos pendientes antes de reanudar
+    try:
+        state = await graph.aget_state(config)
+        if state is None or not state.next:
+            raise HTTPException(status_code=404, detail="No hay ninguna acción pendiente para este hilo")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("[API][CHAT] → resume | no se pudo verificar el estado | %s", exc)
+
     await graph.aupdate_state(config, {"hitl_approved": body.approved})
     logger.info("[API][CHAT] → aupdate_state | completado | thread='%s' hitl_approved=%s", thread_id, body.approved)
 
