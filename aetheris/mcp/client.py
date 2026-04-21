@@ -8,6 +8,7 @@ Servidores disponibles:
   - gmail    → Gmail (@gongrzhe/server-gmail-autoauth-mcp)
 """
 import logging
+from pathlib import Path
 from typing import Any
 
 from aetheris.config import get_settings
@@ -91,10 +92,11 @@ async def get_mcp_tools(include_tavily: bool = True, include_google: bool = True
         logger.info("[MCP] → get_mcp_tools | Tavily omitido (sin API key o desactivado)")
 
     # -- Google Calendar + Gmail -----------------------------------------------
+    # Comprobamos la existencia del fichero client_secret (no las env vars individuales,
+    # que pueden estar vacías cuando las credenciales vienen del fichero JSON).
     google_available = bool(
-        settings.google_client_id
-        and settings.google_client_secret
-        and settings.google_refresh_token
+        settings.google_refresh_token
+        and Path(settings.google_client_secret_file).exists()
     )
 
     if include_google and google_available:
@@ -160,9 +162,8 @@ async def get_mcp_tools_persistent(
         servers["tavily"] = get_tavily_server_config()
 
     google_available = bool(
-        settings.google_client_id
-        and settings.google_client_secret
-        and settings.google_refresh_token
+        settings.google_refresh_token
+        and Path(settings.google_client_secret_file).exists()
     )
     if include_google and google_available:
         creds_ok = ensure_google_credentials_files()

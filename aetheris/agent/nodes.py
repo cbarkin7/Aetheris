@@ -13,6 +13,7 @@ from aetheris.agent.prompts import (
     MANAGER_PROMPT,
     RAG_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    WEB_TOOL_SELECTOR_PROMPT,
 )
 from aetheris.agent.state import AgentState
 from aetheris.config import get_settings
@@ -36,17 +37,29 @@ logger = logging.getLogger(__name__)
 _VALID_INTENTS = frozenset({"rag", "web_search", "google_action", "plain_llm"})
 
 _HITL_DESTRUCTIVE_ACTIONS = frozenset({
-    # --- @cocal/google-calendar-mcp ---
+    # --- @cocal/google-calendar-mcp (nombres reales con guión) ---
+    "create-event",
+    "create-events",
+    "update-event",
+    "delete-event",
+    "respond-to-event",
+    # variantes con guión bajo por compatibilidad
     "create_event",
     "update_event",
     "delete_event",
-    "create_calendar_event",   # alias por compatibilidad
-    # --- @gongrzhe/server-gmail-autoauth-mcp ---
+    "create_calendar_event",
+    # --- @gongrzhe/server-gmail-autoauth-mcp (nombres reales con guión) ---
+    "send-email",
+    "reply-to-email",
+    "create-draft",
+    # variantes con guión bajo
     "send_email",
     "send_gmail",
     "reply_to_email",
     "create_draft",
     # --- Drive (futuro) ---
+    "delete-file",
+    "move-file",
     "delete_file",
     "move_file",
 })
@@ -291,8 +304,15 @@ def rag_node(state: AgentState) -> dict:
 # Nodo: web_search_node
 # ---------------------------------------------------------------------------
 
-def web_search_node(state: AgentState, mcp_tools: list | None = None) -> dict:
-    """Ejecuta una búsqueda web de Tavily mediante herramientas MCP."""
+async def web_search_node(state: AgentState, mcp_tools: list | None = None) -> dict:
+    """
+    Ejecuta una operación web con Tavily (async).
+
+    Usa WEB_TOOL_SELECTOR_PROMPT para que el LLM elija la herramienta Tavily
+    más adecuada (search / research / extract / crawl / map) y construya sus
+    argumentos a partir del mensaje del usuario.
+    Fallback a tavily_search si el selector falla.
+    """
     logger.info(
         "[WEB-SEARCH] → web_search_node | inicio | herramientas_mcp=%d",
         len(mcp_tools) if mcp_tools else 0,
@@ -302,22 +322,74 @@ def web_search_node(state: AgentState, mcp_tools: list | None = None) -> dict:
         logger.warning("[WEB-SEARCH] → web_search_node | sin herramientas MCP → fallback plain_llm")
         return {"intent": "plain_llm"}
 
-    tavily_tool = _find_tool_by_keyword(mcp_tools, "search")
-    if not tavily_tool:
-        logger.warning("[WEB-SEARCH] → web_search_node | herramienta 'search' no encontrada → fallback plain_llm")
+    # Filtrar únicamente las herramientas Tavily disponibles
+    tavily_tools = [t for t in mcp_tools if t.name.startswith("tavily_")]
+    if not tavily_tools:
+        logger.warning("[WEB-SEARCH] → web_search_node | sin herramientas Tavily → fallback plain_llm")
         return {"intent": "plain_llm"}
 
     last_human = _last_human(state["messages"])
     query = last_human.content if last_human else ""
-    logger.info("[WEB-SEARCH] → web_search_node | ejecutando | tool='%s' query='%.60s'", tavily_tool.name, query)
+
+    # ── Selección de herramienta via LLM ────────────────────────────────────
+    tool_descriptions = "\n".join(
+        f"- {t.name}: {t.description[:120]}" for t in tavily_tools
+    )
+    selector_prompt = WEB_TOOL_SELECTOR_PROMPT.format(
+        tool_descriptions=tool_descriptions,
+        query=query,
+    )
+
+    # Mapa de argumentos por defecto para cada tool Tavily
+    # (usados como fallback si el selector LLM falla o devuelve args vacíos)
+    _DEFAULT_ARGS: dict[str, dict] = {
+        "tavily_search":   {"query": query},
+        "tavily_research": {"input": query},   # ← la API exige "input", no "query"
+        "tavily_extract":  {"urls": []},
+        "tavily_crawl":    {"url": ""},
+        "tavily_map":      {"url": ""},
+    }
+
+    selected_tool_name = "tavily_search"
+    tool_args: dict = {"query": query}
 
     try:
-        result = tavily_tool.invoke({"query": query})
-        logger.info("[WEB-SEARCH] → web_search_node | completado | resultado_len=%d", len(str(result)))
-        search_message = AIMessage(content=f"[Resultados de búsqueda web]\n{result}")
+        llm, _ = get_llm()
+        raw = llm.invoke([HumanMessage(content=selector_prompt)]).content.strip()
+        # Limpiar bloque markdown si el LLM lo incluye
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        selection = json.loads(raw)
+        selected_tool_name = selection.get("tool", "tavily_search")
+        # Usar args del selector; si vienen vacíos, usar los defaults por tool
+        tool_args = selection.get("args") or _DEFAULT_ARGS.get(selected_tool_name, {"query": query})
+        logger.info(
+            "[WEB-SEARCH] → web_search_node | selector | tool='%s' args=%s",
+            selected_tool_name, str(tool_args)[:120],
+        )
+    except Exception as exc:
+        logger.warning(
+            "[WEB-SEARCH] → web_search_node | selector fallido (%s) → tavily_search", exc
+        )
+
+    # Resolver la herramienta seleccionada; si no existe, usar la primera disponible
+    tool = _find_tool(tavily_tools, selected_tool_name) or tavily_tools[0]
+    logger.info("[WEB-SEARCH] → web_search_node | ejecutando | tool='%s'", tool.name)
+
+    try:
+        # Las herramientas MCP de langchain-mcp-adapters son async-only.
+        result = await tool.ainvoke(tool_args)
+        result_str = str(result)
+        logger.info(
+            "[WEB-SEARCH] → web_search_node | completado | tool='%s' resultado_len=%d",
+            tool.name, len(result_str),
+        )
+        search_message = AIMessage(content=f"[Resultados web — {tool.name}]\n{result_str}")
         return {"messages": [search_message]}
     except Exception as exc:
-        logger.error("[WEB-SEARCH] → web_search_node | fallido | error=%s", exc)
+        logger.error("[WEB-SEARCH] → web_search_node | fallido | tool='%s' error=%s", tool.name, exc)
         return {"error": str(exc)}
 
 
@@ -386,22 +458,41 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
             logger.debug("[HITL] → hitl_node | descripción fallback | %s", exc)
             description = f"{tc['name']}: {json.dumps(tc['args'], ensure_ascii=False)}"
 
-        pending.append({"name": tc["name"], "args": tc["args"], "description": description})
+        # Conservar el id real del tool_call para que google_action_node
+        # pueda crear ToolMessages con tool_call_id correcto (requisito OpenAI).
+        pending.append({
+            "id": tc.get("id", tc["name"]),
+            "name": tc["name"],
+            "args": tc["args"],
+            "description": description,
+        })
 
     logger.info(
         "[HITL] → hitl_node | completado | acciones_pendientes=%d | %s",
         len(pending), [p["name"] for p in pending],
     )
-    return {"tool_calls_pending": pending, "messages": [response]}
+
+    if pending:
+        # Hay acciones destructivas: añadir el mensaje del LLM (con tool_calls)
+        # al estado para que google_action_node pueda completar el intercambio
+        # con los ToolMessages correspondientes.
+        return {"tool_calls_pending": pending, "messages": [response]}
+
+    # Sin acciones destructivas: NO añadir el AIMessage con tool_calls al historial.
+    # Si se añadiera sin los ToolMessages de respuesta, OpenAI devolvería 400
+    # ("tool_calls must be followed by tool messages").
+    # El grafo continúa hacia llm_node que genera la respuesta final.
+    return {"tool_calls_pending": []}
 
 
 # ---------------------------------------------------------------------------
 # Nodo: google_action_node
 # ---------------------------------------------------------------------------
 
-def google_action_node(state: AgentState, mcp_tools: list | None = None) -> dict:
+async def google_action_node(state: AgentState, mcp_tools: list | None = None) -> dict:
     """
-    Ejecuta las llamadas aprobadas a herramientas de Google Workspace.
+    Ejecuta las llamadas aprobadas a herramientas de Google Workspace (async).
+    Las herramientas MCP de langchain-mcp-adapters son async-only: se usa ainvoke().
     Registra cada resultado en action_results para que el SSE emita feedback
     inmediato por acción (éxito o fallo) antes de que llm_node genere el resumen.
     """
@@ -427,22 +518,28 @@ def google_action_node(state: AgentState, mcp_tools: list | None = None) -> dict
                 "name": call["name"],
                 "error": f"Herramienta '{call['name']}' no encontrada en el servidor MCP",
             })
+            tc_id_missing = call.get("id", call["name"])
             result_messages.append(
-                ToolMessage(content=f"Error: herramienta '{call['name']}' no disponible", tool_call_id=call["name"])
+                ToolMessage(
+                    content=f"Error: herramienta '{call['name']}' no disponible",
+                    tool_call_id=tc_id_missing,
+                )
             )
             continue
 
+        # Usar el id real del tool_call (requerido por OpenAI para emparejar con la AIMessage)
+        tc_id = call.get("id", call["name"])
         try:
             logger.info("[GOOGLE] → google_action_node | ejecutando | tool='%s'", call["name"])
-            result = tool.invoke(call["args"])
+            result = await tool.ainvoke(call["args"])
             summary = str(result)[:300]
-            result_messages.append(ToolMessage(content=str(result), tool_call_id=call["name"]))
+            result_messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
             action_results.append({"ok": True, "name": call["name"], "summary": summary})
             logger.info("[GOOGLE] → google_action_node | tool='%s' → completado", call["name"])
         except Exception as exc:
             error_msg = str(exc)
             logger.error("[GOOGLE] → google_action_node | tool='%s' → fallido | %s", call["name"], error_msg)
-            result_messages.append(ToolMessage(content=f"Error: {error_msg}", tool_call_id=call["name"]))
+            result_messages.append(ToolMessage(content=f"Error: {error_msg}", tool_call_id=tc_id))
             action_results.append({"ok": False, "name": call["name"], "error": error_msg})
 
     ok_count = sum(1 for r in action_results if r["ok"])

@@ -29,7 +29,7 @@ st.caption("Agente Cognitivo Autónomo")
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "user_id" not in st.session_state:
-    st.session_state.user_id = "default"
+    st.session_state.user_id = "Admin-Aetheris"
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "hitl_pending" not in st.session_state:
@@ -42,12 +42,22 @@ if "last_audio_key" not in st.session_state:
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Sesión")
-    st.text_input("ID de usuario", key="user_id", value=st.session_state.user_id)
+    # Usamos una clave auxiliar para evitar que st.text_input(key="user_id")
+    # sobreescriba la sesión con cadena vacía en el primer renderizado.
+    new_user_id = st.text_input(
+        "ID de usuario",
+        value=st.session_state.user_id,
+        key="_user_id_input",
+    )
+    if new_user_id and new_user_id != st.session_state.user_id:
+        st.session_state.user_id = new_user_id
+
     st.text_input(
-        "ID de hilo",
-        key="thread_id_display",
+        "ID de conversación",
         value=st.session_state.thread_id,
+        key="_thread_id_display",
         disabled=True,
+        help="Copia este ID para retomar la conversación más tarde.",
     )
     if st.button("Nueva conversación"):
         st.session_state.thread_id = str(uuid.uuid4())
@@ -55,6 +65,26 @@ with st.sidebar:
         st.session_state.hitl_pending = None
         st.session_state.last_audio_key = None
         st.rerun()
+
+    st.divider()
+
+    # Recuperar conversación existente por ID
+    with st.expander("🔄 Retomar conversación"):
+        recovery_id = st.text_input(
+            "ID de conversación",
+            key="_recovery_id",
+            placeholder="Pega aquí el ID…",
+        )
+        if st.button("Cargar", key="_load_conv"):
+            if recovery_id and recovery_id.strip():
+                st.session_state.thread_id = recovery_id.strip()
+                st.session_state.messages = []
+                st.session_state.hitl_pending = None
+                st.session_state.last_audio_key = None
+                st.success(f"Conversación `{recovery_id[:12]}…` cargada")
+                st.rerun()
+            else:
+                st.warning("Introduce un ID de conversación válido.")
 
     st.divider()
     st.caption("Modelo: GPT-4o-mini · Fallback: Bedrock")
@@ -113,7 +143,12 @@ def _send_message(prompt: str) -> None:
                 event = json.loads(line[6:])
                 etype = event.get("type")
 
-                if etype == "token":
+                if etype == "conversation_id":
+                    # Actualizar el thread_id con el asignado por el backend
+                    # (puede diferir si el cliente no lo envió)
+                    st.session_state.thread_id = event["thread_id"]
+
+                elif etype == "token":
                     full_response += event["content"]
                     placeholder.markdown(full_response + "▌")
 

@@ -11,8 +11,9 @@ from pydantic import BaseModel, Field
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4096)
-    thread_id: str = Field(..., description="Session/thread identifier")
-    user_id: str = Field(default="default", description="User identifier")
+    # thread_id es opcional: si no se envía, el backend genera un UUID nuevo.
+    thread_id: str | None = Field(default=None, description="Session/thread identifier (auto-generated if omitted)")
+    user_id: str = Field(default="Admin-Aetheris", description="User identifier")
     stream: bool = Field(default=True)
 
 

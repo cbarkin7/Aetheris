@@ -16,6 +16,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from aetheris.agent.edges import (
     route_after_hitl,
+    route_after_hitl_node,
     route_after_input_guardrail,
     route_after_tool,
     route_by_intent,
@@ -79,6 +80,10 @@ def build_graph(mcp_tools: list | None = None, checkpointer=None) -> CompiledSta
     builder.add_node("rag_node", rag_node)
     builder.add_node("web_search_node", _web_search)
     builder.add_node("hitl_node", _hitl)
+    # Nodo vacío que actúa como punto de interrupción cuando hay acciones HITL
+    # pendientes. El grafo pausa ANTES de ejecutarlo (interrupt_before), lo que
+    # garantiza que solo se interrumpe cuando realmente hay acciones que confirmar.
+    builder.add_node("hitl_wait_node", lambda state: {})
     builder.add_node("google_action_node", _google_action)
     builder.add_node("llm_node", llm_node)
     builder.add_node("output_guardrail_node", output_guardrail_node)
@@ -115,9 +120,16 @@ def build_graph(mcp_tools: list | None = None, checkpointer=None) -> CompiledSta
     # plan_dispatch → siguiente herramienta (ciclo controlado por execution_plan)
     builder.add_conditional_edges("plan_dispatch_node", route_by_intent, _INTENT_TARGETS)
 
-    # HITL
+    # HITL: hitl_node decide si hay acciones pendientes o no
     builder.add_conditional_edges(
         "hitl_node",
+        route_after_hitl_node,
+        {"hitl_wait_node": "hitl_wait_node", "llm_node": "llm_node"},
+    )
+    # hitl_wait_node es el punto de interrupción real (interrupt_before).
+    # Al reanudar, route_after_hitl evalúa hitl_approved y enruta.
+    builder.add_conditional_edges(
+        "hitl_wait_node",
         route_after_hitl,
         {"google_action_node": "google_action_node", "llm_node": "llm_node"},
     )
@@ -128,14 +140,14 @@ def build_graph(mcp_tools: list | None = None, checkpointer=None) -> CompiledSta
     builder.add_edge("output_guardrail_node", "save_memory_node")
     builder.add_edge("save_memory_node", END)
 
-    # interrupt_after: hitl_node se ejecuta completo (popula tool_calls_pending
-    # y genera las descripciones) y el grafo pausa DESPUÉS. Así on_chain_end
-    # de hitl_node llega al SSE y el frontend recibe el evento hitl_required
-    # con las acciones a confirmar. Al reanudar, LangGraph evalúa route_after_hitl
-    # con hitl_approved ya fijado por aupdate_state — sin re-ejecutar hitl_node.
+    # interrupt_before=["hitl_wait_node"]: el grafo solo pausa cuando hay acciones
+    # destructivas pendientes (hitl_node ruta a hitl_wait_node únicamente en ese caso).
+    # Si no hay acciones pendientes, hitl_node ruta directamente a llm_node sin pausa.
+    # on_chain_end de hitl_node llega al SSE antes de la pausa, permitiendo que el
+    # frontend reciba el evento hitl_required con las acciones a confirmar.
     graph = builder.compile(
         checkpointer=checkpointer,
-        interrupt_after=["hitl_node"],
+        interrupt_before=["hitl_wait_node"],
     )
 
     logger.info("Grafo AETHERIS compilado (herramientas MCP: %d)", len(tools))

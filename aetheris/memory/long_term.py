@@ -9,7 +9,7 @@ Dos capas:
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -146,7 +146,7 @@ def store_long_term_fact(
         metadata={
             "user_id": user_id,
             "source": source,
-            "stored_at": datetime.utcnow().isoformat(),
+            "stored_at": datetime.now(timezone.utc).isoformat(),
         },
     )
     ids = store.add_documents([doc])

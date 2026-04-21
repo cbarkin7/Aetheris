@@ -37,8 +37,20 @@ def route_after_tool(state: AgentState) -> str:
     return "llm_node"
 
 
+def route_after_hitl_node(state: AgentState) -> str:
+    """
+    Enruta desde hitl_node:
+    - Si hay acciones destructivas pendientes → hitl_wait_node (el grafo pausará aquí
+      con interrupt_before para esperar la aprobación del usuario).
+    - Si no → llm_node directamente (sin pausa, sin HITL).
+    """
+    if state.get("tool_calls_pending"):
+        return "hitl_wait_node"
+    return "llm_node"
+
+
 def route_after_hitl(state: AgentState) -> str:
-    """Enruta desde hitl_node según la aprobación del usuario."""
+    """Enruta desde hitl_wait_node según la aprobación del usuario."""
     if state.get("hitl_approved") is True:
         return "google_action_node"
     return "llm_node"

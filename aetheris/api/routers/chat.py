@@ -3,6 +3,7 @@ Endpoints de chat con streaming SSE y reanudación de Human-in-the-Loop.
 """
 import json
 import logging
+import uuid
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -112,18 +113,21 @@ async def chat(
     graph=Depends(get_compiled_graph),
 ) -> StreamingResponse:
     """Iniciar o continuar una sesión de chat. Devuelve un stream SSE."""
+    # Generar thread_id si el cliente no lo envía (nueva conversación)
+    thread_id = body.thread_id or str(uuid.uuid4())
+
     logger.info(
         "[API][CHAT] → POST /chat | recibida | thread='%s' user='%s' msg_len=%d",
-        body.thread_id, body.user_id, len(body.message),
+        thread_id, body.user_id, len(body.message),
     )
 
     from aetheris.observability.tracing import get_langsmith_callbacks
     callbacks = get_langsmith_callbacks()
 
-    config = _build_config(body.thread_id, body.user_id, callbacks)
+    config = _build_config(thread_id, body.user_id, callbacks)
     input_data = {
         "messages": [HumanMessage(content=body.message)],
-        "thread_id": body.thread_id,
+        "thread_id": thread_id,
         "user_id": body.user_id,
         "rag_context": [],
         "tool_calls_pending": [],
@@ -136,8 +140,14 @@ async def chat(
         "intent": "unknown",
     }
 
+    async def _stream_with_id() -> AsyncGenerator[str, None]:
+        # Primer evento: notificar el thread_id activo al frontend
+        yield f"data: {json.dumps({'type': 'conversation_id', 'thread_id': thread_id})}\n\n"
+        async for chunk in _stream_graph(graph, input_data, config):
+            yield chunk
+
     return StreamingResponse(
-        _stream_graph(graph, input_data, config),
+        _stream_with_id(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

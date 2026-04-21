@@ -25,7 +25,7 @@ st.set_page_config(
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "user_id" not in st.session_state:
-    st.session_state.user_id = "default"
+    st.session_state.user_id = "Admin-Aetheris"
 
 # Navigation
 pages = {
