@@ -17,34 +17,51 @@ Inicia o continúa una conversación. Devuelve un stream SSE (Server-Sent Events
 {
   "message": "¿Qué dice mi informe Q4 sobre los ingresos?",
   "thread_id": "uuid-del-hilo",
-  "user_id": "usuario123",
+  "user_id": "Admin-Aetheris",
   "stream": true
 }
 ```
 
 | Campo | Tipo | Obligatorio | Descripción |
 |---|---|---|---|
-| `message` | `string` | Sí | Mensaje del usuario |
-| `thread_id` | `string` | Sí | ID de hilo para checkpointing (usar UUID) |
-| `user_id` | `string` | No | ID de usuario para memoria (por defecto: `"default"`) |
+| `message` | `string` | Sí | Mensaje del usuario (1–4096 chars) |
+| `thread_id` | `string` | No | ID de hilo para checkpointing. Si se omite, el backend genera un UUID nuevo. |
+| `user_id` | `string` | No | ID de usuario para memoria (por defecto: `"Admin-Aetheris"`) |
 | `stream` | `boolean` | No | Activar streaming SSE (por defecto: `true`) |
 
-**Eventos SSE de respuesta:**
+**Eventos SSE de respuesta (en orden de aparición):**
 
-| Tipo de evento | Datos | Descripción |
+| Tipo | Payload | Descripción |
 |---|---|---|
-| `token` | `{"type": "token", "content": "texto"}` | Token de respuesta generado |
-| `done` | `{"type": "done"}` | Respuesta completada |
-| `hitl_required` | `{"type": "hitl_required", "actions": [...]}` | Acción Google pendiente de aprobación |
-| `guardrail_blocked` | `{"type": "guardrail_blocked", "violations": [...]}` | Mensaje bloqueado por seguridad |
-| `error` | `{"type": "error", "message": "..."}` | Error durante el procesamiento |
+| `conversation_id` | `{"type": "conversation_id", "thread_id": "uuid"}` | **Primer evento siempre.** Comunica el `thread_id` activo (generado o recibido). |
+| `token` | `{"type": "token", "content": "texto"}` | Token de respuesta generado por el LLM. |
+| `done` | `{"type": "done"}` | Respuesta completada correctamente. |
+| `hitl_required` | `{"type": "hitl_required", "actions": [...]}` | Acción destructiva Google pendiente de aprobación del usuario. |
+| `action_result` | `{"type": "action_result", "name": "...", "summary": "..."}` | Feedback inmediato de acción Google ejecutada correctamente (tras HITL aprobado). |
+| `action_error` | `{"type": "action_error", "name": "...", "error": "..."}` | Feedback de acción Google fallida (tras HITL aprobado). |
+| `guardrail_blocked` | `{"type": "guardrail_blocked", "violations": [...]}` | Mensaje bloqueado por guardrail de seguridad. |
+| `error` | `{"type": "error", "message": "..."}` | Error durante el procesamiento del agente. |
+
+**Ejemplo de evento `conversation_id`:**
+```json
+{"type": "conversation_id", "thread_id": "f40e6f4b-4df2-4f2c-9207-172380d4623d"}
+```
 
 **Ejemplo de evento `hitl_required`:**
 ```json
 {
   "type": "hitl_required",
   "actions": [
-    {"name": "create_calendar_event", "args": {"title": "Reunión", "start": "2026-04-15T10:00"}}
+    {
+      "id": "call_abc123",
+      "name": "create-event",
+      "args": {
+        "summary": "Reunión de equipo",
+        "start": {"dateTime": "2026-04-22T10:00:00"},
+        "end":   {"dateTime": "2026-04-22T11:00:00"}
+      },
+      "description": "Crear evento 'Reunión de equipo' el 22 de abril de 10:00 a 11:00."
+    }
   ]
 }
 ```
@@ -56,22 +73,25 @@ Inicia o continúa una conversación. Devuelve un stream SSE (Server-Sent Events
 Reanuda la ejecución del agente tras una interrupción HITL (Human-in-the-Loop).
 
 **Parámetros de ruta:**
-- `thread_id` — ID del hilo a reanudar
+- `thread_id` — ID del hilo a reanudar (devuelto por el evento `conversation_id`)
 
 **Cuerpo de la solicitud:**
 ```json
 {
   "approved": true,
-  "user_id": "usuario123"
+  "user_id": "Admin-Aetheris"
 }
 ```
 
 | Campo | Tipo | Obligatorio | Descripción |
 |---|---|---|---|
 | `approved` | `boolean` | Sí | `true` para aprobar la acción, `false` para rechazarla |
-| `user_id` | `string` | No | ID de usuario (por defecto: `"default"`) |
+| `user_id` | `string` | No | ID de usuario (por defecto: `"Admin-Aetheris"`) |
 
-**Respuesta:** Stream SSE idéntico al del endpoint `/chat`.
+**Respuesta:** Stream SSE con los eventos `action_result`/`action_error` por cada acción ejecutada, seguidos de `token` y `done` con el resumen generado por el LLM.
+
+**Errores:**
+- `404 Not Found` — No hay ninguna acción pendiente para el hilo indicado.
 
 ---
 
@@ -82,13 +102,13 @@ Recupera el historial completo de mensajes de un hilo de conversación.
 **Parámetros de ruta:**
 - `thread_id` — ID del hilo
 
-**Respuesta:**
+**Respuesta (200 OK):**
 ```json
 {
-  "thread_id": "uuid-del-hilo",
+  "thread_id": "f40e6f4b-4df2-4f2c-9207-172380d4623d",
   "messages": [
-    {"role": "human", "content": "¿Qué es AETHERIS?"},
-    {"role": "ai", "content": "AETHERIS es un agente cognitivo autónomo..."}
+    {"role": "human", "content": "¿Qué es AETHERIS?", "timestamp": null},
+    {"role": "ai",    "content": "AETHERIS es un agente cognitivo autónomo...", "timestamp": null}
   ]
 }
 ```
@@ -115,7 +135,7 @@ Sube e ingesta un documento en la base de conocimiento RAG.
   "filename": "informe_q4.pdf",
   "n_chunks": 42,
   "collection_name": "aetheris",
-  "ingested_at": "2026-04-13T10:00:00"
+  "ingested_at": "2026-04-20T10:00:00"
 }
 ```
 
@@ -135,9 +155,7 @@ Lista todos los documentos indexados en Chroma.
   {
     "document_id": "md5hash",
     "filename": "informe_q4.pdf",
-    "n_chunks": 42,
-    "collection_name": "aetheris",
-    "ingested_at": "2026-04-13T10:00:00"
+    "source": "data/uploads/informe_q4.pdf"
   }
 ]
 ```
@@ -166,7 +184,7 @@ Recupera la memoria a largo plazo (preferencias KV) de un usuario.
 **Respuesta (200 OK):**
 ```json
 {
-  "user_id": "usuario123",
+  "user_id": "Admin-Aetheris",
   "preferences": {
     "language": "Spanish",
     "timezone": "Europe/Madrid",
@@ -194,10 +212,35 @@ Actualiza (upsert) las preferencias a largo plazo de un usuario.
 **Respuesta (200 OK):**
 ```json
 {
-  "user_id": "usuario123",
+  "user_id": "Admin-Aetheris",
   "updated_keys": ["language", "timezone"]
 }
 ```
+
+---
+
+## Audio / STT
+
+### `POST /api/v1/speech/transcribe`
+
+Transcribe un fichero de audio a texto mediante faster-whisper (STT local).
+
+**Cuerpo de la solicitud (form-data):**
+
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `file` | `File` | Fichero de audio (mp3, wav, m4a, ogg, webm) |
+
+**Respuesta (200 OK):**
+```json
+{
+  "text": "Crea una reunión para el lunes a las diez de la mañana."
+}
+```
+
+**Errores:**
+- `400 Bad Request` — Formato de audio no soportado
+- `503 Service Unavailable` — faster-whisper no está disponible (modelo no descargado)
 
 ---
 
@@ -256,6 +299,7 @@ Comprueba la conectividad con LangSmith.
 | `DELETE` | `/api/v1/documents/{document_id}` | Eliminar documento |
 | `GET` | `/api/v1/memory/{user_id}` | Leer memoria del usuario |
 | `PUT` | `/api/v1/memory/{user_id}` | Actualizar memoria del usuario |
+| `POST` | `/api/v1/speech/transcribe` | Transcribir audio a texto (faster-whisper) |
 | `GET` | `/api/v1/health` | Estado general del sistema |
 | `GET` | `/api/v1/health/langsmith` | Conectividad con LangSmith |
 
@@ -266,10 +310,10 @@ Comprueba la conectividad con LangSmith.
 | Código | Descripción |
 |---|---|
 | `400` | Solicitud incorrecta (tipo de fichero no soportado, parámetros inválidos) |
-| `404` | Recurso no encontrado (documento, hilo) |
+| `404` | Recurso no encontrado (documento, hilo sin checkpoint HITL pendiente) |
 | `422` | Entidad no procesable (validación Pydantic fallida) |
 | `500` | Error interno del servidor (fallo del LLM, Chroma inaccesible) |
-| `503` | Servicio no disponible (servidores MCP no iniciados) |
+| `503` | Servicio no disponible (servidores MCP no iniciados, Whisper no disponible) |
 
 ---
 
