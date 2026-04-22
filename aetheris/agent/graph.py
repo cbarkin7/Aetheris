@@ -10,6 +10,7 @@ Flujo principal:
 """
 import functools
 import logging
+from pathlib import Path
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -151,6 +152,17 @@ def build_graph(mcp_tools: list | None = None, checkpointer=None) -> CompiledSta
     )
 
     logger.info("Grafo AETHERIS compilado (herramientas MCP: %d)", len(tools))
+
+    # Guardar el diagrama visual (PNG via Mermaid).
+    try:
+        png_bytes = graph.get_graph().draw_mermaid_png()
+        graph_img = Path("data/graph.png")
+        graph_img.parent.mkdir(parents=True, exist_ok=True)
+        graph_img.write_bytes(png_bytes)
+        logger.info("Diagrama del grafo guardado en: %s", graph_img.resolve())
+    except Exception:  # noqa: BLE001
+        logger.debug("No se pudo generar el diagrama del grafo.")
+
     return graph
 
 

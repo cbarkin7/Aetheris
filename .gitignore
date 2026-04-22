@@ -3,6 +3,7 @@
 .env.local
 
 # Data (persisted at runtime — never commit)
+data/
 data/chroma_db/
 data/sqlite/
 data/uploads/
