@@ -107,15 +107,47 @@ def list_documents(collection_name: str = "aetheris", embeddings: Any = None) ->
     all_meta = collection.get(include=["metadatas"])["metadatas"]
 
     seen: dict[str, dict] = {}
+    counts: dict[str, int] = {}
     for meta in all_meta:
         doc_id = meta.get("document_id", "")
-        if doc_id and doc_id not in seen:
+        if not doc_id:
+            continue
+        counts[doc_id] = counts.get(doc_id, 0) + 1
+        if doc_id not in seen:
             seen[doc_id] = {
                 "document_id": doc_id,
                 "filename": meta.get("filename", ""),
                 "source": meta.get("source", ""),
+                "ingested_at": meta.get("ingested_at"),
             }
+
+    # Attach chunk counts
+    for doc_id, info in seen.items():
+        info["n_chunks"] = counts.get(doc_id, 0)
+
     return list(seen.values())
+
+
+def get_document_info(
+    document_id: str,
+    collection_name: str = "aetheris",
+    embeddings: Any = None,
+) -> dict | None:
+    """Return metadata for a specific document_id, or None if not found."""
+    vectorstore = get_vectorstore(collection_name=collection_name, embeddings=embeddings)
+    collection = vectorstore._collection
+    results = collection.get(where={"document_id": document_id}, include=["metadatas"])
+    metas = results.get("metadatas") or []
+    if not metas:
+        return None
+    meta = metas[0]
+    return {
+        "document_id": document_id,
+        "filename": meta.get("filename", ""),
+        "source": meta.get("source", ""),
+        "ingested_at": meta.get("ingested_at"),
+        "n_chunks": len(metas),
+    }
 
 
 def delete_document(document_id: str, collection_name: str = "aetheris", embeddings: Any = None) -> int:

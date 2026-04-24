@@ -133,7 +133,7 @@ def _send_message(prompt: str) -> None:
                     "stream": True,
                 },
                 stream=True,
-                timeout=120,
+                timeout=(10, 180),  # (connect_timeout, read_timeout) — 180s para búsquedas largas
             )
             resp.raise_for_status()
 

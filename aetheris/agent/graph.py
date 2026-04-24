@@ -106,7 +106,7 @@ def build_graph(mcp_tools: list | None = None, checkpointer=None) -> CompiledSta
     # Manager → primera herramienta (o llm directo)
     builder.add_conditional_edges("manager_node", route_by_intent, _INTENT_TARGETS)
 
-    # Después de herramienta → continuar plan o ir a llm
+    # Después de herramienta → continuar plan, fallback a web_search, o ir a llm
     builder.add_conditional_edges(
         "rag_node",
         route_after_tool,

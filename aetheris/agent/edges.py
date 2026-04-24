@@ -28,9 +28,13 @@ def route_by_intent(state: AgentState) -> str:
 
 def route_after_tool(state: AgentState) -> str:
     """
-    Después de ejecutar una herramienta (rag, web_search), comprueba si
-    quedan pasos en execution_plan. Si sí, va a plan_dispatch_node para
-    continuar el plan; si no, va directamente a llm_node.
+    Después de ejecutar una herramienta (rag_node o web_search_node):
+
+    1. Si quedan pasos en execution_plan → plan_dispatch_node (continúa el plan).
+    2. En cualquier otro caso → llm_node.
+
+    No hay fallback automático RAG→web: la búsqueda web solo se activa cuando
+    el usuario la pide explícitamente y el manager la incluye en el plan.
     """
     if state.get("execution_plan"):
         return "plan_dispatch_node"

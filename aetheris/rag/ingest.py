@@ -4,6 +4,7 @@ Loads documents from disk, chunks them, embeds and stores in Chroma.
 """
 import hashlib
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,11 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md"}
 def _document_id(file_path: Path) -> str:
     """Stable document ID based on file path."""
     return hashlib.md5(str(file_path.resolve()).encode()).hexdigest()
+
+
+def document_id_for_path(file_path: Path | str) -> str:
+    """Public helper: returns the stable document ID for a given path."""
+    return _document_id(Path(file_path))
 
 
 def load_documents(source: Path | str) -> list[Document]:
@@ -123,6 +129,11 @@ def embed_and_store(
         logger.debug("[RAG][INGEST] → embed_and_store | modelo='%s'", settings.embedding_model)
 
     vectorstore = _get_chroma(collection_name, embeddings)
+
+    # Stamp ingestion timestamp on every chunk so it can be queried later
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for chunk in chunks:
+        chunk.metadata["ingested_at"] = now_iso
 
     # Build stable IDs per chunk to allow safe re-ingestion (idempotent)
     ids = [

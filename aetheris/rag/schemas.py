@@ -1,6 +1,5 @@
 """RAG domain schemas."""
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
@@ -10,7 +9,9 @@ class IngestResult(BaseModel):
     n_chunks: int
     collection_name: str
     document_id: str
-    ingested_at: datetime = Field(default_factory=datetime.utcnow)
+    ingested_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
 
 class RetrievalResult(BaseModel):

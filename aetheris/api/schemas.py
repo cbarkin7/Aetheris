@@ -41,6 +41,17 @@ class DocumentSchema(BaseModel):
     document_id: str
     filename: str
     source: str
+    ingested_at: datetime | None = None
+    n_chunks: int | None = None
+
+
+class DocumentConflictDetail(BaseModel):
+    """Payload devuelto en 409 cuando el documento ya existe en Chroma."""
+    document_id: str
+    filename: str
+    ingested_at: datetime | None
+    n_chunks: int
+    message: str = "El documento ya existe en la base de conocimiento."
 
 
 class IngestResultSchema(BaseModel):

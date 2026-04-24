@@ -61,6 +61,55 @@ async def lifespan(app: FastAPI):
     app.state.graph = build_graph(mcp_tools=mcp_tools, checkpointer=checkpointer)
     logger.info("[SISTEMA] → build_graph | completado | grafo listo para recibir peticiones")
 
+    # -------------------------------------------------------------------------
+    # FIXME: Remove — preview del contenido de la vector DB (debug, quitar antes de release)
+    # -------------------------------------------------------------------------
+    try:
+        from aetheris.rag.retriever import get_vectorstore
+        _vs = get_vectorstore()
+        _col = _vs._collection
+        _data = _col.get(include=["metadatas", "documents"])
+        _ids: list = _data.get("ids", [])
+        _metas: list = _data.get("metadatas", []) or []
+        _docs: list = _data.get("documents", []) or []
+
+        # Agrupar por document_id
+        _groups: dict = {}
+        for _i, _meta in enumerate(_metas):
+            _did = _meta.get("document_id", "unknown")
+            if _did not in _groups:
+                _groups[_did] = {
+                    "filename": _meta.get("filename", "?"),
+                    "ingested_at": _meta.get("ingested_at", "sin fecha"),
+                    "chunks": [],
+                }
+            _groups[_did]["chunks"].append({
+                "index": _meta.get("chunk_index", _i),
+                "content": _docs[_i] if _i < len(_docs) else "",
+            })
+
+        logger.info(
+            "[CHROMA][PREVIEW] Base de conocimiento: %d fragmentos en %d documento(s)",
+            len(_ids), len(_groups),
+        )
+        for _did, _info in _groups.items():
+            _sorted_chunks = sorted(_info["chunks"], key=lambda x: x["index"])
+            _preview = ""
+            if _sorted_chunks:
+                _raw = _sorted_chunks[0]["content"][:200].replace("\n", " ").strip()
+                _preview = (_raw + "…") if len(_sorted_chunks[0]["content"]) > 200 else _raw
+            logger.info(
+                "[CHROMA][PREVIEW]   📄 %-40s | id=%-10s | %3d fragmentos | %s\n"
+                "                        ↳ %s",
+                _info["filename"], _did[:8] + "…", len(_info["chunks"]),
+                _info["ingested_at"][:19] if _info["ingested_at"] != "sin fecha" else "sin fecha",
+                _preview,
+            )
+    except Exception as _exc:
+        logger.debug("[CHROMA][PREVIEW] No se pudo leer el estado de Chroma: %s", _exc)
+    # FIXME: Remove — fin preview vector DB
+    # -------------------------------------------------------------------------
+
     yield
 
     # Shutdown

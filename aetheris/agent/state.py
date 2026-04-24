@@ -25,6 +25,9 @@ class AgentState(TypedDict):
     # Fragmentos RAG recuperados: lista de {content, source, score}
     rag_context: list[dict]
 
+    # Resultado de la búsqueda web (texto plano listo para inyectar en el prompt)
+    web_context: str | None
+
     # Llamadas a herramientas MCP pendientes de aprobación HITL
     # Cada elemento: {name, args, description}
     tool_calls_pending: list[dict]

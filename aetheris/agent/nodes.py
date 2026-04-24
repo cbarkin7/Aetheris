@@ -28,6 +28,57 @@ from aetheris.memory.long_term import (
 )
 from aetheris.rag.retriever import retrieve
 
+
+# ---------------------------------------------------------------------------
+# Helper: sanear historial de mensajes antes de enviarlo al LLM
+# ---------------------------------------------------------------------------
+
+def _sanitize_tool_calls(messages: list) -> list:
+    """
+    Garantiza que todo AIMessage con tool_calls tenga su ToolMessage de respuesta.
+
+    OpenAI y Bedrock exigen que cada tool_call_id del asistente sea respondido
+    por un ToolMessage antes de la siguiente interacción. Cuando el usuario
+    rechaza una acción HITL, el AIMessage con tool_calls queda huérfano.
+    Este helper inyecta ToolMessages sintéticos para los IDs sin responder.
+    """
+    sanitized: list = []
+    n = len(messages)
+
+    for i, msg in enumerate(messages):
+        sanitized.append(msg)
+
+        if not (isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None)):
+            continue
+
+        # IDs ya respondidos por ToolMessages inmediatamente siguientes
+        responded: set[str] = set()
+        for j in range(i + 1, n):
+            nxt = messages[j]
+            if isinstance(nxt, ToolMessage):
+                responded.add(nxt.tool_call_id)
+            else:
+                break
+
+        # Inyectar ToolMessage sintético para cada ID sin responder
+        for tc in msg.tool_calls:
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "tool")
+            if tc_id and tc_id not in responded:
+                sanitized.append(
+                    ToolMessage(
+                        content="Acción cancelada por el usuario.",
+                        tool_call_id=tc_id,
+                        name=tc_name,
+                    )
+                )
+                logger.debug(
+                    "[LLM] _sanitize_tool_calls | ToolMessage sintético inyectado | tc_id='%s' name='%s'",
+                    tc_id, tc_name,
+                )
+
+    return sanitized
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -239,6 +290,26 @@ def manager_node(state: AgentState) -> dict:
         logger.warning("[MANAGER] → manager_node | error al parsear plan | %s → fallback plain_llm", exc)
         steps = ["plain_llm"]
 
+    # ── Corrección determinista ───────────────────────────────────────────────
+    # El LLM no puede saber qué hay en los documentos del usuario, por lo que
+    # tiende a elegir plain_llm cuando no tiene pistas explícitas en el mensaje.
+    # Si el plan es solo plain_llm y existen fragmentos en Chroma, forzamos rag
+    # como primer paso. El grafo ya gestiona el fallback rag→web_search si no
+    # se encuentran resultados relevantes.
+    if steps == ["plain_llm"]:
+        try:
+            from aetheris.rag.retriever import get_vectorstore
+            _chroma_count = get_vectorstore()._collection.count()
+            if _chroma_count > 0:
+                steps = ["rag"]
+                logger.info(
+                    "[MANAGER] → manager_node | plain_llm→rag (override) | %d fragmentos en Chroma",
+                    _chroma_count,
+                )
+        except Exception:
+            pass  # Si Chroma no está disponible, mantener plain_llm
+    # ─────────────────────────────────────────────────────────────────────────
+
     first_step = steps[0]
     remaining = steps[1:]
 
@@ -378,19 +449,55 @@ async def web_search_node(state: AgentState, mcp_tools: list | None = None) -> d
     tool = _find_tool(tavily_tools, selected_tool_name) or tavily_tools[0]
     logger.info("[WEB-SEARCH] → web_search_node | ejecutando | tool='%s'", tool.name)
 
+    # Timeouts por herramienta: tavily_research es más lento que el resto
+    _TOOL_TIMEOUTS = {
+        "tavily_research": 45.0,
+        "tavily_crawl":    30.0,
+        "tavily_extract":  20.0,
+        "tavily_search":   15.0,
+        "tavily_map":      15.0,
+    }
+    timeout_s = _TOOL_TIMEOUTS.get(tool.name, 20.0)
+
     try:
+        import asyncio
         # Las herramientas MCP de langchain-mcp-adapters son async-only.
-        result = await tool.ainvoke(tool_args)
+        result = await asyncio.wait_for(tool.ainvoke(tool_args), timeout=timeout_s)
         result_str = str(result)
         logger.info(
             "[WEB-SEARCH] → web_search_node | completado | tool='%s' resultado_len=%d",
             tool.name, len(result_str),
         )
-        search_message = AIMessage(content=f"[Resultados web — {tool.name}]\n{result_str}")
-        return {"messages": [search_message]}
+        # Guardamos en web_context (no en messages) para que llm_node lo inyecte
+        # en el system prompt. Si lo guardásemos como AIMessage, el LLM lo
+        # interpretaría como una respuesta suya anterior y generaría respuestas
+        # incoherentes del tipo "voy a buscar más información".
+        web_context = f"[Búsqueda web — {tool.name}]\n{result_str}"
+        # intent="web_search" evita que route_after_tool aplique el fallback RAG→web
+        # de nuevo cuando ya venimos de web_search_node.
+        return {"web_context": web_context, "intent": "web_search"}
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[WEB-SEARCH] → web_search_node | TIMEOUT (%.0fs) en tool='%s' → fallback tavily_search",
+            timeout_s, tool.name,
+        )
+        # Fallback a tavily_search si la herramienta principal tardó demasiado
+        fallback = _find_tool(tavily_tools, "tavily_search") or tavily_tools[0]
+        if fallback.name != tool.name:
+            try:
+                result = await asyncio.wait_for(
+                    fallback.ainvoke({"query": query}), timeout=15.0
+                )
+                result_str = str(result)
+                web_context = f"[Búsqueda web — {fallback.name} (fallback)]\n{result_str}"
+                logger.info("[WEB-SEARCH] → web_search_node | fallback completado | len=%d", len(result_str))
+                return {"web_context": web_context, "intent": "web_search"}
+            except Exception as fb_exc:
+                logger.error("[WEB-SEARCH] → web_search_node | fallback también falló | %s", fb_exc)
+        return {"web_context": None, "error": f"Timeout en {tool.name}", "intent": "web_search"}
     except Exception as exc:
         logger.error("[WEB-SEARCH] → web_search_node | fallido | tool='%s' error=%s", tool.name, exc)
-        return {"error": str(exc)}
+        return {"web_context": None, "error": str(exc), "intent": "web_search"}
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +689,8 @@ def llm_node(state: AgentState) -> dict:
     memory_str = json.dumps(state.get("user_memory", {}), ensure_ascii=False, indent=2)
     system_content = SYSTEM_PROMPT.format(user_memory=memory_str)
 
+    intent = state.get("intent", "plain_llm")
+
     if rag_context:
         context_str = "\n\n".join(
             f"[{i+1}] (fuente: {c['source']}, puntuación: {c['score']:.2f})\n{c['content']}"
@@ -589,12 +698,34 @@ def llm_node(state: AgentState) -> dict:
         )
         system_content += "\n\n" + RAG_SYSTEM_PROMPT.format(rag_context=context_str)
         logger.debug("[LLM] → llm_node | contexto RAG inyectado | fragmentos=%d", len(rag_context))
+    elif intent == "rag":
+        # RAG se consultó pero no encontró nada: prohibir respuesta desde conocimiento general
+        system_content += (
+            "\n\nEl sistema ha buscado en los documentos del usuario y NO ha encontrado "
+            "información relevante para esta pregunta. "
+            "Debes responder ÚNICAMENTE: "
+            "'No he encontrado información sobre ese tema en tus documentos. "
+            "Si quieres, puedo buscar información actualizada en internet — "
+            "indícamelo y lo haré.'"
+        )
+        logger.info("[LLM] → llm_node | RAG sin resultados → respuesta de no encontrado")
+
+    web_context = state.get("web_context")
+    if web_context:
+        system_content += (
+            "\n\n## Resultados de búsqueda web\n"
+            "Usa la siguiente información obtenida en tiempo real para complementar tu respuesta. "
+            "Cita las fuentes cuando sea relevante.\n\n"
+            + web_context
+        )
+        logger.debug("[LLM] → llm_node | contexto web inyectado | len=%d", len(web_context))
 
     if state.get("hitl_approved") is False and state.get("tool_calls_pending"):
         system_content += "\n\nEl usuario ha rechazado la acción de Google solicitada. Acéptalo con amabilidad."
         logger.info("[LLM] → llm_node | acción HITL rechazada por el usuario")
 
-    messages = [SystemMessage(content=system_content)] + list(state["messages"])
+    raw_messages = _sanitize_tool_calls(list(state["messages"]))
+    messages = [SystemMessage(content=system_content)] + raw_messages
     logger.debug("[LLM] → llm_node | invocando LLM | proveedor=%s mensajes_totales=%d", provider, len(messages))
 
     response = llm.invoke(messages)
