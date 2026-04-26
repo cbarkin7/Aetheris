@@ -271,6 +271,15 @@ def manager_node(state: AgentState) -> dict:
     memory_str = json.dumps(state.get("user_memory", {}), ensure_ascii=False)
     prompt = MANAGER_PROMPT.format(user_memory=memory_str, messages=messages_text)
 
+    # FIXME: Eliminar en prod — variables inyectadas en MANAGER_PROMPT
+    logger.debug(
+        "[FIXME-PROMPT] manager_node | MANAGER_PROMPT vars\n"
+        "  user_memory → %s\n"
+        "  messages    →\n%s",
+        memory_str[:400],
+        messages_text[:600],
+    )
+
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         raw = response.content.strip()
@@ -310,6 +319,16 @@ def manager_node(state: AgentState) -> dict:
             pass  # Si Chroma no está disponible, mantener plain_llm
     # ─────────────────────────────────────────────────────────────────────────
 
+    # Fix 3: "plain_llm" como segundo paso es inválido.
+    # llm_node siempre se ejecuta al final; incluirlo en el plan hace que
+    # plan_dispatch_node sobreescriba intent="plain_llm" y llm_node pierda
+    # la protección "not found" del RAG cuando no hay resultados.
+    if len(steps) == 2 and steps[1] == "plain_llm":
+        steps = [steps[0]]
+        logger.info(
+            "[MANAGER] → manager_node | plan saneado | 'plain_llm' eliminado como segundo paso"
+        )
+
     first_step = steps[0]
     remaining = steps[1:]
 
@@ -317,7 +336,17 @@ def manager_node(state: AgentState) -> dict:
         "[MANAGER] → manager_node | plan=%s proveedor=%s | intent='%s' pasos_restantes=%s",
         steps, provider, first_step, remaining,
     )
-    return {"intent": first_step, "execution_plan": remaining, "llm_provider": provider}
+
+    # Fix 1: Limpiar contextos del turno anterior para evitar contaminación
+    # entre preguntas (state bleed). web_context y rag_context son propios de
+    # cada turno y no deben persistir en el checkpointer entre turnos.
+    return {
+        "intent": first_step,
+        "execution_plan": remaining,
+        "llm_provider": provider,
+        "web_context": None,  # Fix 1: limpiar entre turnos
+        "rag_context": [],    # Fix 1: limpiar entre turnos
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +356,7 @@ def manager_node(state: AgentState) -> dict:
 def plan_dispatch_node(state: AgentState) -> dict:
     """
     Toma el siguiente paso del plan de ejecución y lo establece como `intent`.
-    Si el plan está vacío, establece `plain_llm` para ir al llm_node.
+    Si el plan está vacío, conserva el intent actual (Fix 2: no sobreescribir con plain_llm).
     """
     plan = list(state.get("execution_plan", []))
     if plan:
@@ -338,8 +367,11 @@ def plan_dispatch_node(state: AgentState) -> dict:
         )
         return {"intent": next_intent, "execution_plan": plan}
 
-    logger.info("[PLAN] → plan_dispatch_node | plan vacío → plain_llm")
-    return {"intent": "plain_llm", "execution_plan": []}
+    # Fix 2: No sobreescribir intent cuando el plan ya está vacío.
+    # Forzar intent="plain_llm" haría que llm_node pierda el contexto de la
+    # operación actual (p. ej. "rag") y omita la protección "not found".
+    logger.info("[PLAN] → plan_dispatch_node | plan vacío → llm_node (intent actual conservado)")
+    return {"execution_plan": []}
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +441,15 @@ async def web_search_node(state: AgentState, mcp_tools: list | None = None) -> d
     selector_prompt = WEB_TOOL_SELECTOR_PROMPT.format(
         tool_descriptions=tool_descriptions,
         query=query,
+    )
+
+    # FIXME: Eliminar en prod — variables inyectadas en WEB_TOOL_SELECTOR_PROMPT
+    logger.debug(
+        "[FIXME-PROMPT] web_search_node | WEB_TOOL_SELECTOR_PROMPT vars\n"
+        "  query            → %.200s\n"
+        "  tool_descriptions→\n%s",
+        query,
+        tool_descriptions,
     )
 
     # Mapa de argumentos por defecto para cada tool Tavily
@@ -713,8 +754,12 @@ def llm_node(state: AgentState) -> dict:
     web_context = state.get("web_context")
     if web_context:
         system_content += (
-            "\n\n## Resultados de búsqueda web\n"
-            "Usa la siguiente información obtenida en tiempo real para complementar tu respuesta. "
+            "\n\n## Resultados de búsqueda web (búsqueda ya ejecutada)\n"
+            "IMPORTANTE: La búsqueda web se ha realizado AUTOMÁTICAMENTE antes de esta respuesta. "
+            "Los resultados están disponibles a continuación. "
+            "NO digas que vas a buscar, ni 'un momento', ni 'procederé a buscar' — "
+            "eso ya ocurrió. Integra directamente la información en tu respuesta "
+            "combinándola con el contexto de documentos si lo hubiera. "
             "Cita las fuentes cuando sea relevante.\n\n"
             + web_context
         )
@@ -723,6 +768,20 @@ def llm_node(state: AgentState) -> dict:
     if state.get("hitl_approved") is False and state.get("tool_calls_pending"):
         system_content += "\n\nEl usuario ha rechazado la acción de Google solicitada. Acéptalo con amabilidad."
         logger.info("[LLM] → llm_node | acción HITL rechazada por el usuario")
+
+    # FIXME: Eliminar en prod — variables inyectadas en SYSTEM_PROMPT / RAG_SYSTEM_PROMPT
+    logger.debug(
+        "[FIXME-PROMPT] llm_node | variables de prompt\n"
+        "  intent      → %s\n"
+        "  user_memory → %.300s\n"
+        "  rag_context → %d fragmentos | %s\n"
+        "  web_context → %s",
+        intent,
+        memory_str,
+        len(rag_context),
+        [(c.get("source", "?"), round(c.get("score", 0), 3)) for c in rag_context],
+        (web_context[:200] + "…") if web_context else "None",
+    )
 
     raw_messages = _sanitize_tool_calls(list(state["messages"]))
     messages = [SystemMessage(content=system_content)] + raw_messages
