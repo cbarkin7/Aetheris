@@ -154,7 +154,7 @@ def _send_message(prompt: str) -> None:
 
                 elif etype == "hitl_required":
                     hitl_actions = event.get("actions", [])
-                    placeholder.markdown("_Esperando tu aprobación…_")
+                    placeholder.markdown("⏳ **Acción lista — necesito tu aprobación para continuar.**")
                     break
 
                 elif etype == "guardrail_blocked":
@@ -180,17 +180,34 @@ def _send_message(prompt: str) -> None:
         st.session_state.messages.append({"role": "assistant", "content": full_response})
 
     if hitl_actions:
+        # Guardar en historial el aviso antes del rerun para que aparezca
+        # como último mensaje del chat y el usuario vea que hay algo pendiente.
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "⏳ **Acción lista — necesito tu aprobación para continuar.** Revisa la solicitud a continuación.",
+        })
         st.session_state.hitl_pending = hitl_actions
         st.rerun()
 
 
 # ---------------------------------------------------------------------------
-# Modal HITL
+# Historial de conversación
+# ---------------------------------------------------------------------------
+for msg in st.session_state.messages:
+    render_message(msg["role"], msg["content"])
+
+# ---------------------------------------------------------------------------
+# Modal HITL — se renderiza AL FINAL del historial para que el usuario lo vea
 # ---------------------------------------------------------------------------
 if st.session_state.hitl_pending:
     approval = render_hitl_modal(st.session_state.hitl_pending)
     if approval is not None:
         st.session_state.hitl_pending = None
+        # Eliminar el mensaje "⏳ Acción lista…" del historial antes de reanudar
+        st.session_state.messages = [
+            m for m in st.session_state.messages
+            if "Acción lista" not in m.get("content", "")
+        ]
 
         try:
             resp = requests.post(
@@ -216,7 +233,6 @@ if st.session_state.hitl_pending:
                     etype = event.get("type")
 
                     if etype == "action_result":
-                        # Acción ejecutada correctamente — feedback inmediato
                         name = event.get("name", "")
                         summary = event.get("summary", "")
                         msg = f"✅ **{name}** ejecutado correctamente."
@@ -226,7 +242,6 @@ if st.session_state.hitl_pending:
                         placeholder.markdown("\n\n".join(action_feedback) + "\n\n_Generando resumen…_ ⏳")
 
                     elif etype == "action_error":
-                        # Acción fallida — mostrar cuál y continuar con el resto
                         name = event.get("name", "")
                         error = event.get("error", "Error desconocido")
                         action_feedback.append(f"❌ **{name}** ha fallado: {error}")
@@ -244,10 +259,8 @@ if st.session_state.hitl_pending:
 
                     elif etype == "error":
                         st.error(f"Error durante la ejecución: {event.get('message', '')}")
-                        # El chat queda disponible para el siguiente mensaje
                         break
 
-            # Guardar en historial todo lo mostrado (feedback de acciones + resumen LLM)
             combined_parts = action_feedback[:]
             if full_response:
                 combined_parts.append(full_response)
@@ -258,12 +271,6 @@ if st.session_state.hitl_pending:
                 })
 
             st.rerun()
-
-# ---------------------------------------------------------------------------
-# Historial de conversación
-# ---------------------------------------------------------------------------
-for msg in st.session_state.messages:
-    render_message(msg["role"], msg["content"])
 
 # ---------------------------------------------------------------------------
 # Entrada de audio (sobre la entrada de texto)
@@ -295,7 +302,10 @@ with col_info:
                 st.warning("No se pudo transcribir el audio. Intenta escribir el mensaje.")
 
 # ---------------------------------------------------------------------------
-# Entrada de texto
+# Entrada de texto — deshabilitada mientras hay una aprobación HITL pendiente
 # ---------------------------------------------------------------------------
-if prompt := st.chat_input("O escribe tu mensaje aquí…"):
-    _send_message(prompt)
+if st.session_state.hitl_pending:
+    st.chat_input("Aprueba o rechaza la acción antes de continuar…", disabled=True)
+else:
+    if prompt := st.chat_input("O escribe tu mensaje aquí…"):
+        _send_message(prompt)

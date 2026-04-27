@@ -8,6 +8,8 @@ import logging
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+logger = logging.getLogger(__name__)
+
 from aetheris.agent.prompts import (
     HITL_DESCRIPTION_PROMPT,
     MANAGER_PROMPT,
@@ -79,7 +81,6 @@ def _sanitize_tool_calls(messages: list) -> list:
 
     return sanitized
 
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -164,6 +165,43 @@ def _find_tool_by_keyword(tools: list, keyword: str):
     return next((t for t in tools if keyword in t.name.lower()), None)
 
 
+def _restore_pii(args: dict, pii_map: dict[str, str]) -> dict:
+    """
+    Sustituye placeholders PII por los valores originales en los argumentos de una tool.
+
+    Itera recursivamente sobre dicts y listas para cubrir estructuras anidadas
+    (p. ej. {"to": ["[EMAIL_REDACTADO]"], "body": "...firma [EMAIL_REDACTADO]..."}).
+
+    Args:
+        args:    Argumentos de la tool call (dict, posiblemente anidado).
+        pii_map: {placeholder: valor_original} generado por input_guardrail_node.
+
+    Returns:
+        Nuevo dict con los placeholders reemplazados por los valores reales.
+    """
+    if not pii_map:
+        return args
+
+    def _restore_value(val):
+        if isinstance(val, str):
+            for placeholder, original in pii_map.items():
+                val = val.replace(placeholder, original)
+            return val
+        if isinstance(val, list):
+            return [_restore_value(v) for v in val]
+        if isinstance(val, dict):
+            return {k: _restore_value(v) for k, v in val.items()}
+        return val
+
+    restored = _restore_value(args)
+    if restored != args:
+        logger.info(
+            "[GOOGLE] _restore_pii | PII restaurado en args | placeholders=%s",
+            list(pii_map.keys()),
+        )
+    return restored
+
+
 # ---------------------------------------------------------------------------
 # Nodo: input_guardrail_node
 # ---------------------------------------------------------------------------
@@ -200,19 +238,30 @@ def input_guardrail_node(state: AgentState) -> dict:
         )
         return {"guardrail_passed": False, "guardrail_violations": result.violations}
 
-    redacted = result.redactions and result.sanitized_text != text
+    redacted = bool(result.redactions and result.sanitized_text != text)
     logger.info(
-        "[GUARDRAIL-IN] → input_guardrail_node | completado | passed=True redacciones_pii=%s",
+        "[GUARDRAIL-IN] → input_guardrail_node | completado | passed=True redacciones_pii=%d placeholders=%s",
         len(result.redactions) if redacted else 0,
+        list(result.redactions.keys()) if redacted else [],
     )
 
     if redacted:
+        # Reemplazar el mensaje original usando el mismo id — add_messages de LangGraph
+        # actualiza en lugar de añadir cuando el id coincide.
+        # pii_map {placeholder→valor_original} se persiste en state para que
+        # google_action_node pueda restaurar los datos reales antes de invocar
+        # herramientas de Google (Gmail, Calendar, Drive).
         return {
             "guardrail_passed": True,
-            "guardrail_violations": [],
-            "messages": [HumanMessage(content=result.sanitized_text)],
+            "guardrail_violations": list(result.redactions.keys()),
+            "pii_map": result.redactions,
+            "messages": [HumanMessage(content=result.sanitized_text, id=last_human.id)],
         }
 
+    # Sin redacciones: NO devolver pii_map — el valor del checkpoint del turno
+    # anterior debe conservarse para que google_action_node pueda restaurar PII
+    # en turnos de seguimiento ("Vuelve a intentarlo", "añade X", etc.) que no
+    # repiten los datos sensibles pero sí necesitan ejecutar la tool con ellos.
     return {"guardrail_passed": True, "guardrail_violations": []}
 
 
@@ -268,14 +317,18 @@ def manager_node(state: AgentState) -> dict:
 
     llm, provider = get_llm()
     messages_text = _messages_to_text(state["messages"])
-    memory_str = json.dumps(state.get("user_memory", {}), ensure_ascii=False)
+    # Excluir _mem0_context del user_memory del manager: es un resumen de conversación
+    # voluminoso (pipe-separated) útil para llm_node pero que contamina el contexto
+    # de enrutamiento con historial irrelevante para decidir el plan de herramientas.
+    routing_memory = {k: v for k, v in state.get("user_memory", {}).items() if k != "_mem0_context"}
+    memory_str = json.dumps(routing_memory, ensure_ascii=False)
     prompt = MANAGER_PROMPT.format(user_memory=memory_str, messages=messages_text)
 
     # FIXME: Eliminar en prod — variables inyectadas en MANAGER_PROMPT
     logger.debug(
         "[FIXME-PROMPT] manager_node | MANAGER_PROMPT vars\n"
-        "  user_memory → %s\n"
-        "  messages    →\n%s",
+        "  routing_memory → %s\n"
+        "  messages       →\n%s",
         memory_str[:400],
         messages_text[:600],
     )
@@ -300,23 +353,35 @@ def manager_node(state: AgentState) -> dict:
         steps = ["plain_llm"]
 
     # ── Corrección determinista ───────────────────────────────────────────────
-    # El LLM no puede saber qué hay en los documentos del usuario, por lo que
-    # tiende a elegir plain_llm cuando no tiene pistas explícitas en el mensaje.
-    # Si el plan es solo plain_llm y existen fragmentos en Chroma, forzamos rag
-    # como primer paso. El grafo ya gestiona el fallback rag→web_search si no
-    # se encuentran resultados relevantes.
+    # El LLM tiende a elegir plain_llm cuando no detecta señales explícitas.
+    # La override se aplica en cascada con prioridad decreciente:
+    #
+    # 1. Si el intent previo del checkpoint era google_action → mantenerlo.
+    #    Cubre "Vuelve a intentarlo", "inténtalo de nuevo", "añade X y reintenta"
+    #    donde el usuario continúa una acción de Google sin repetir los datos.
+    #
+    # 2. Si Chroma tiene fragmentos → forzar rag.
+    #    Cubre preguntas factuales donde el LLM no sabe qué hay en los documentos.
     if steps == ["plain_llm"]:
-        try:
-            from aetheris.rag.retriever import get_vectorstore
-            _chroma_count = get_vectorstore()._collection.count()
-            if _chroma_count > 0:
-                steps = ["rag"]
-                logger.info(
-                    "[MANAGER] → manager_node | plain_llm→rag (override) | %d fragmentos en Chroma",
-                    _chroma_count,
-                )
-        except Exception:
-            pass  # Si Chroma no está disponible, mantener plain_llm
+        prev_intent = state.get("intent", "")
+        if prev_intent == "google_action":
+            steps = ["google_action"]
+            logger.info(
+                "[MANAGER] → manager_node | plain_llm→google_action (override) | "
+                "contexto de acción Google activo en checkpoint"
+            )
+        else:
+            try:
+                from aetheris.rag.retriever import get_vectorstore
+                _chroma_count = get_vectorstore()._collection.count()
+                if _chroma_count > 0:
+                    steps = ["rag"]
+                    logger.info(
+                        "[MANAGER] → manager_node | plain_llm→rag (override) | %d fragmentos en Chroma",
+                        _chroma_count,
+                    )
+            except Exception:
+                pass  # Si Chroma no está disponible, mantener plain_llm
     # ─────────────────────────────────────────────────────────────────────────
 
     # Fix 3: "plain_llm" como segundo paso es inválido.
@@ -584,10 +649,15 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
             )],
         }
 
-    # Invocar LLM con las herramientas para detectar qué acciones quiere ejecutar
+    # Invocar LLM con las herramientas para detectar qué acciones quiere ejecutar.
+    # _sanitize_tool_calls es obligatorio: en turnos posteriores el historial puede
+    # contener AIMessages con tool_calls huérfanos (sin ToolMessage de respuesta)
+    # de intentos anteriores que el usuario amplió con más información.
+    # Sin esto, OpenAI devuelve 400 "tool_calls must be followed by tool messages".
     logger.info("[HITL] → hitl_node | herramientas_google=%d | detectando acciones", len(google_tools))
     llm_with_tools, _ = get_llm(tools=google_tools)
-    response = llm_with_tools.invoke(list(state["messages"]))
+    sanitized_messages = _sanitize_tool_calls(list(state["messages"]))
+    response = llm_with_tools.invoke(sanitized_messages)
     tool_calls = getattr(response, "tool_calls", []) or []
 
     # Para cada acción destructiva, generar descripción legible con HITL_DESCRIPTION_PROMPT
@@ -678,8 +748,14 @@ async def google_action_node(state: AgentState, mcp_tools: list | None = None) -
         # Usar el id real del tool_call (requerido por OpenAI para emparejar con la AIMessage)
         tc_id = call.get("id", call["name"])
         try:
+            # Restaurar PII antes de ejecutar: los args contienen placeholders
+            # ([EMAIL_REDACTADO], [TELEFONO_REDACTADO], etc.) porque el LLM trabajó
+            # con el texto saneado. pii_map devuelve los valores originales necesarios
+            # para que Gmail/Calendar/Drive reciban datos válidos.
+            pii_map = state.get("pii_map", {})
+            exec_args = _restore_pii(call["args"], pii_map)
             logger.info("[GOOGLE] → google_action_node | ejecutando | tool='%s'", call["name"])
-            result = await tool.ainvoke(call["args"])
+            result = await tool.ainvoke(exec_args)
             summary = str(result)[:300]
             result_messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
             action_results.append({"ok": True, "name": call["name"], "summary": summary})
@@ -805,15 +881,15 @@ def output_guardrail_node(state: AgentState) -> dict:
     """Sanea la última respuesta del asistente antes de entregarla."""
     if not get_settings().guardrails_enabled:
         logger.debug("[GUARDRAIL-OUT] → output_guardrail_node | saltado | guardrails desactivados")
-        return {}
+        return {"guardrail_passed": True, "guardrail_violations": []}
 
     messages = state.get("messages", [])
     if not messages:
-        return {}
+        return {"guardrail_passed": True, "guardrail_violations": []}
 
     last_msg = messages[-1]
     if not isinstance(last_msg, AIMessage):
-        return {}
+        return {"guardrail_passed": True, "guardrail_violations": []}
 
     text = last_msg.content if isinstance(last_msg.content, str) else ""
     logger.info("[GUARDRAIL-OUT] → output_guardrail_node | inicio | msg_len=%d", len(text))
@@ -825,10 +901,14 @@ def output_guardrail_node(state: AgentState) -> dict:
             "[GUARDRAIL-OUT] → output_guardrail_node | REDACTADO | redacciones=%s violaciones=%s",
             result.redactions, result.violations,
         )
-        return {"messages": [AIMessage(content=result.sanitized_text)]}
+        return {
+            "messages": [AIMessage(content=result.sanitized_text)],
+            "guardrail_passed": True,
+            "guardrail_violations": result.violations,
+        }
 
-    logger.info("[GUARDRAIL-OUT] → output_guardrail_node | completado | sin redacciones")
-    return {}
+    logger.info("[GUARDRAIL-OUT] → output_guardrail_node | completado | passed=True redacciones=0")
+    return {"guardrail_passed": True, "guardrail_violations": []}
 
 
 # ---------------------------------------------------------------------------

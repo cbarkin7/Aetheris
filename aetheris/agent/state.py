@@ -48,6 +48,11 @@ class AgentState(TypedDict):
     # Violaciones detectadas por guardrails
     guardrail_violations: list[str]
 
+    # Mapa reversible de redacciones PII: {placeholder: valor_original}
+    # Generado por input_guardrail_node, consumido por google_action_node
+    # para restaurar emails, teléfonos, etc. antes de invocar las tools de Google.
+    pii_map: dict[str, str]
+
     # Proveedor LLM activo (para trazabilidad del fallback)
     llm_provider: str
 

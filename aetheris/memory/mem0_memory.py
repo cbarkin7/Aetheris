@@ -15,7 +15,17 @@ from aetheris.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Silenciar los logs ERROR internos de mem0 (mem0.client.utils, mem0.proxy.*, etc.)
+# que se emiten antes de propagar la excepción a nuestro código. Los errores de
+# conexión son fallos esperados y degradables — no deben aparecer como ERROR en
+# los logs del agente. Nuestro propio código ya registra el fallo a nivel WARNING.
+logging.getLogger("mem0").setLevel(logging.WARNING)
+
 _mem0_client: Any = None
+
+# Circuit breaker: evita reintentos en cascada cuando mem0 no está disponible.
+# Se activa tras el primer fallo de conexión y se resetea al reiniciar el proceso.
+_mem0_circuit_open: bool = False
 
 
 def _build_mem0_cloud():
@@ -80,6 +90,15 @@ def get_mem0_client() -> Any:
     return _mem0_client
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    """Detecta errores de red/conexión para activar el circuit breaker."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in (
+        "connection", "winerror", "timeout", "unreachable",
+        "refused", "reset", "eof", "broken pipe",
+    ))
+
+
 def add_conversation_memory(
     messages: list[dict[str, str]],
     user_id: str,
@@ -94,8 +113,13 @@ def add_conversation_memory(
         session_id: Identificador de sesión (opcional).
 
     Returns:
-        Resultado de mem0.add() con los hechos extraídos.
+        Resultado de mem0.add() con los hechos extraídos, o {} si no disponible.
     """
+    global _mem0_circuit_open
+    if _mem0_circuit_open:
+        logger.debug("mem0: circuit breaker abierto — omitiendo add para user='%s'", user_id)
+        return {}
+
     client = get_mem0_client()
     kwargs: dict[str, Any] = {"user_id": user_id}
     if session_id:
@@ -109,7 +133,13 @@ def add_conversation_memory(
         )
         return result
     except Exception as exc:
-        logger.error("mem0: error al registrar conversación: %s", exc)
+        if _is_connection_error(exc):
+            _mem0_circuit_open = True
+            logger.warning(
+                "mem0: fallo de conexión — circuit breaker activado | %s", exc
+            )
+        else:
+            logger.warning("mem0: error al registrar conversación: %s", exc)
         return {}
 
 
@@ -125,6 +155,10 @@ def search_memory(
         Lista de memorias: [{memory, id, score, ...}]
     """
     client = get_mem0_client()
+    if _mem0_circuit_open:
+        logger.debug("mem0: circuit breaker abierto — omitiendo search para user='%s'", user_id)
+        return []
+
     try:
         # La API v2 de mem0 cloud (MemoryClient) exige el parámetro `filters` explícito;
         # pasar solo `user_id` produce 400 "Filters are required and cannot be empty".
@@ -144,26 +178,42 @@ def search_memory(
             return results.get("results", [])
         return results if isinstance(results, list) else []
     except Exception as exc:
-        logger.error("mem0: error en búsqueda de memoria: %s", exc)
+        if _is_connection_error(exc):
+            _mem0_circuit_open = True
+            logger.warning("mem0: fallo de conexión en search — circuit breaker activado | %s", exc)
+        else:
+            logger.warning("mem0: error en búsqueda de memoria: %s", exc)
         return []
 
 
 def get_all_memories(user_id: str) -> list[dict]:
     """Obtiene todas las memorias almacenadas para un usuario."""
     client = get_mem0_client()
+    if _mem0_circuit_open:
+        logger.debug("mem0: circuit breaker abierto — omitiendo get_all para user='%s'", user_id)
+        return []
+
     try:
         result = client.get_all(user_id=user_id)
         if isinstance(result, dict):
             return result.get("results", [])
         return result if isinstance(result, list) else []
     except Exception as exc:
-        logger.error("mem0: error al obtener memorias: %s", exc)
+        if _is_connection_error(exc):
+            _mem0_circuit_open = True
+            logger.warning("mem0: fallo de conexión en get_all — circuit breaker activado | %s", exc)
+        else:
+            logger.warning("mem0: error al obtener memorias: %s", exc)
         return []
 
 
 def delete_all_memories(user_id: str) -> None:
     """Elimina todas las memorias de un usuario."""
     client = get_mem0_client()
+    if _mem0_circuit_open:
+        logger.debug("mem0: circuit breaker abierto — omitiendo delete_all para user='%s'", user_id)
+        return
+
     try:
         memories = get_all_memories(user_id)
         for mem in memories:
@@ -172,4 +222,8 @@ def delete_all_memories(user_id: str) -> None:
                 client.delete(mem_id)
         logger.info("mem0: eliminadas todas las memorias para user='%s'", user_id)
     except Exception as exc:
-        logger.error("mem0: error al eliminar memorias: %s", exc)
+        if _is_connection_error(exc):
+            _mem0_circuit_open = True
+            logger.warning("mem0: fallo de conexión en delete_all — circuit breaker activado | %s", exc)
+        else:
+            logger.warning("mem0: error al eliminar memorias: %s", exc)

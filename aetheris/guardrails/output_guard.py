@@ -75,10 +75,17 @@ class OutputGuard:
                     logger.warning("Contenido inseguro redactado en la salida: %s", name)
 
         # 3. Redacción de PII en la salida
+        # El output guard solo necesita el texto saneado; el mapa reversible
+        # (pii_map) no tiene utilidad aquí porque la salida nunca se usa como
+        # argumento de herramientas.
         if self._redact_pii:
-            sanitized, redactions = redact_pii(sanitized, _PII_PATTERNS, _PII_REPLACEMENTS)
-            for pii_type, count in redactions.items():
-                logger.warning("Fuga de PII prevenida: %d %s en la salida", count, pii_type)
+            sanitized, pii_map_out = redact_pii(sanitized, _PII_PATTERNS, _PII_REPLACEMENTS)
+            redactions: dict[str, str] = pii_map_out
+            if pii_map_out:
+                logger.warning(
+                    "Fuga de PII prevenida en la salida: %d valores | placeholders=%s",
+                    len(pii_map_out), list(pii_map_out.keys()),
+                )
         else:
             redactions = {}
 

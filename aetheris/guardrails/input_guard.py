@@ -52,9 +52,9 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern]] = [
 # ---------------------------------------------------------------------------
 _PII_PATTERNS: dict[str, re.Pattern] = {
     "email": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b"),
-    "iban": re.compile(r"\b[A-Z]{2}\d{2}[\s\-]?(?:\d{4}[\s\-]?){4,7}\d{0,4}\b"),
+    "iban": re.compile(r"\b[A-Za-z]{2}\d{2}[\s\-]?(?:\d{4}[\s\-]?){4,7}\d{0,4}\b"),
     "credit_card": re.compile(r"\b(?:\d{4}[\s\-]?){3}\d{4}\b"),
-    "ssn": re.compile(r"\b\d{3}[\-\s]?\d{2}[\-\s]?\d{4}\b"),
+    "ssn": re.compile(r"\b\d{3}[\-\s]\d{2}[\-\s]\d{4}\b"),
     "dni_nie_es": re.compile(r"\b[XYZxyz]?\d{7,8}[A-Za-z]\b"),
     "phone_intl": re.compile(
         r"(?<!\d)(\+?\d{1,3}[\s\-]?)?(\(?\d{2,4}\)?[\s\-]?)\d{3,4}[\s\-]?\d{3,4}(?!\d)"
@@ -116,11 +116,17 @@ class InputGuard:
             return GuardResult(passed=False, sanitized_text=text, violations=violations)
 
         # 3. Redacción de PII (no bloquea — redacta y continúa)
+        # redact_pii() devuelve ahora pii_map {placeholder: valor_original}
+        # para que google_action_node pueda restaurar los datos reales.
         sanitized = text
-        redactions: dict[str, int] = {}
+        pii_map: dict[str, str] = {}
         if self._redact_pii:
-            sanitized, redactions = redact_pii(text, _PII_PATTERNS, _PII_REPLACEMENTS)
-            for pii_type, count in redactions.items():
-                logger.info("Redactado %d coincidencia(s) de %s en la entrada", count, pii_type)
+            sanitized, pii_map = redact_pii(text, _PII_PATTERNS, _PII_REPLACEMENTS)
+            if pii_map:
+                logger.info(
+                    "Redactados %d valores PII en la entrada: %s",
+                    len(pii_map),
+                    list(pii_map.keys()),
+                )
 
-        return GuardResult(passed=True, sanitized_text=sanitized, violations=[], redactions=redactions)
+        return GuardResult(passed=True, sanitized_text=sanitized, violations=[], redactions=pii_map)
