@@ -2,7 +2,7 @@
 
 **Agente Cognitivo Autónomo** — Trabajo Fin de Máster (TFM, Máster en Soluciones IAG)
 
-AETHERIS evoluciona el concepto de chatbot hacia un agente que **piensa, recupera, busca y actúa**. Combina una base de conocimiento RAG, búsqueda web en tiempo real (Tavily MCP, 5 herramientas), automatización de Google Workspace con confirmación Human-in-the-Loop, memoria persistente con mem0.ai y observabilidad completa con LangSmith — todo ello tras una interfaz Streamlit limpia y con seguridad mediante Guardrails bilingües (EN/ES).
+AETHERIS evoluciona el concepto de chatbot hacia un agente que **piensa, recupera, busca y actúa**. Combina una base de conocimiento RAG, búsqueda web en tiempo real (Tavily MCP, 5 herramientas), automatización de Google Workspace (Calendar, Gmail y Drive) con confirmación Human-in-the-Loop, memoria persistente con mem0.ai y observabilidad completa con LangSmith — todo ello tras una interfaz Streamlit limpia y con seguridad mediante Guardrails bilingües (EN/ES).
 
 ---
 
@@ -16,7 +16,8 @@ Streamlit (puerto 8501) ──SSE──► FastAPI (puerto 8000) ──► Grafo
                          RAG (Chroma)    Herramientas MCP  Memoria
                                        (Tavily 5 tools /  (mem0 + SQLite + Chroma)
                                         Google Calendar
-                                        + Gmail)
+                                        + Gmail HTTP
+                                        + Google Drive)
 ```
 
 Documentación completa de arquitectura: [`docs/architecture.md`](docs/architecture.md)
@@ -29,9 +30,9 @@ Documentación completa de arquitectura: [`docs/architecture.md`](docs/architect
 |---|---|
 | RAG (documentos privados) | LangChain + Chroma, recuperación MMR, >85% tasa de acierto |
 | Búsqueda web — 5 herramientas | `tavily-mcp`: search, research, extract, crawl, map |
-| Google Workspace | Calendar y Gmail mediante servidores MCP OAuth2 |
-| Human-in-the-Loop | LangGraph `interrupt_before` + `hitl_wait_node`, reanudación vía API |
-| Guardrails de seguridad | Filtrado de entrada/salida bilingüe (EN+ES), detección de inyección de prompts, redacción de PII |
+| Google Workspace | Calendar (stdio), Gmail (HTTP+Bearer) y Drive (stdio) mediante MCP OAuth2 |
+| Human-in-the-Loop | LangGraph `interrupt_before` + `hitl_wait_node`, lecturas auto-ejecutadas sin modal |
+| Guardrails de seguridad | Filtrado entrada/salida bilingüe (EN+ES), detección de inyección de prompts, redacción de PII |
 | Fallback LLM | OpenAI → AWS Bedrock (Anthropic Claude) automático |
 | Memoria a corto plazo | mem0.ai (cloud o local con Chroma) |
 | Memoria a largo plazo | SQLite (clave-valor) + Chroma (búsqueda semántica) |
@@ -48,7 +49,8 @@ Documentación completa de arquitectura: [`docs/architecture.md`](docs/architect
 - Python 3.12+
 - Node.js 18+ (necesario para servidores MCP vía `npx`)
 - Claves API: OpenAI, LangSmith, Tavily
-- Google OAuth: `client_secret_aetheris.json` + `GOOGLE_REFRESH_TOKEN` (Calendar y Gmail)
+- Google OAuth: `client_secret_aetheris.json` + `GOOGLE_REFRESH_TOKEN` (Calendar y Drive)
+- (Opcional) Servidor Gmail MCP HTTP externo en `GMAIL_MCP_URL` para las acciones de Gmail
 - (Opcional) Credenciales AWS para fallback Bedrock
 - (Opcional) Clave API de mem0.ai para modo cloud
 
@@ -67,17 +69,35 @@ cp .env.example .env
 
 ### 4. Autorizar Google (una sola vez)
 
+Copia el fichero `client_secret_*.json` de Google Cloud Console en `data/google/` y ejecuta:
+
 ```bash
-# Calendar
+# Calendar — obtiene data/google/.calendar-token.json
+# Windows PowerShell:
+$env:GOOGLE_OAUTH_CREDENTIALS="data/google/client_secret_aetheris.json"
+$env:GOOGLE_CALENDAR_MCP_TOKEN_PATH="data/google/.calendar-token.json"
+npx -y @cocal/google-calendar-mcp auth
+
+# Linux / macOS:
 GOOGLE_OAUTH_CREDENTIALS=data/google/client_secret_aetheris.json \
 GOOGLE_CALENDAR_MCP_TOKEN_PATH=data/google/.calendar-token.json \
 npx -y @cocal/google-calendar-mcp auth
-
-# Gmail
-GMAIL_OAUTH_PATH=data/google/client_secret_aetheris.json \
-GMAIL_CREDENTIALS_PATH=data/google/.gmail-token.json \
-npx -y @gongrzhe/server-gmail-autoauth-mcp
 ```
+
+```bash
+# Drive — obtiene data/google/.drive-token.json
+# Windows PowerShell:
+$env:GOOGLE_OAUTH_CREDENTIALS="data/google/client_secret_aetheris.json"
+npx @modelcontextprotocol/server-gdrive auth
+
+# Linux / macOS:
+GOOGLE_OAUTH_CREDENTIALS=data/google/client_secret_aetheris.json \
+npx @modelcontextprotocol/server-gdrive auth
+```
+
+Copia el `refresh_token` del fichero generado en `GOOGLE_REFRESH_TOKEN` de tu `.env`.
+
+> **Gmail** usa transporte HTTP+Bearer — no requiere `npx auth`. El servidor Gmail MCP HTTP debe estar corriendo en `GMAIL_MCP_URL` antes de arrancar AETHERIS.
 
 ### 5. Ejecutar el backend
 
@@ -121,8 +141,9 @@ python scripts/ingest_documents.py --dir ./docs/
 | `LANGCHAIN_TRACING_V2` | No | Activar trazado LangSmith (`true`) |
 | `TAVILY_API_KEY` | No | Búsqueda web MCP Tavily (5 herramientas) |
 | `MEM0_API_KEY` | No | mem0.ai cloud (dejar vacío para modo local) |
-| `GOOGLE_OAUTH_CREDENTIALS` | No | Ruta a `client_secret_aetheris.json` |
-| `GOOGLE_REFRESH_TOKEN` | No | Refresh token OAuth2 de Google |
+| `GOOGLE_CLIENT_SECRET_FILE` | No | Ruta a `client_secret_aetheris.json` |
+| `GOOGLE_REFRESH_TOKEN` | No | Refresh token OAuth2 de Google (Calendar + Drive) |
+| `GMAIL_MCP_URL` | No | URL del servidor Gmail MCP HTTP (por defecto: `http://localhost:30000/mcp`) |
 | `WHISPER_MODEL_SIZE` | No | Tamaño del modelo Whisper (`small` por defecto) |
 | `GUARDRAILS_ENABLED` | No | Activar guardrails de seguridad (`true`) |
 | `LLM_MODEL` | No | Nombre del modelo (por defecto: `gpt-4o-mini`) |
@@ -135,13 +156,16 @@ Consulta [`.env.example`](.env.example) para la lista completa.
 
 ```
 START → Guardrail entrada → [bloqueado → rechazo | OK → cargar memoria → manager]
-    intent → {RAG | web_search (Tavily) | google_action → hitl_wait (HITL) | LLM directo}
-    → generar respuesta → Guardrail salida → guardar memoria → END
+    intent → {RAG | web_search (Tavily) | google_action → hitl_node | LLM directo}
 ```
 
-**HITL:** el grafo pausa en `hitl_wait_node` con `interrupt_before` únicamente cuando hay
-acciones destructivas pendientes (crear evento, enviar email). El frontend muestra un modal
-de aprobación/rechazo; la reanudación se hace vía `POST /api/v1/chat/{thread_id}/resume`.
+**HITL (Human-in-the-Loop):**
+- **Acciones de lectura** (`list-calendars`, `list_files`, etc.) — auto-ejecutadas sin modal.
+- **Acciones destructivas** (`create-event`, `send-email`, `delete_file`, etc.) — el grafo pausa en `hitl_wait_node` con `interrupt_before`. El frontend muestra un modal de aprobación/rechazo; la reanudación se hace vía `POST /api/v1/chat/{thread_id}/resume`.
+
+```
+    → generar respuesta → Guardrail salida → guardar memoria → END
+```
 
 ---
 
@@ -157,6 +181,18 @@ automáticamente la herramienta Tavily más adecuada según el tipo de consulta:
 | `tavily_extract` | Leer el contenido completo de una URL concreta |
 | `tavily_crawl` | Rastrear un sitio web completo desde su URL raíz |
 | `tavily_map` | Mapear la estructura (listado de URLs) de un sitio web |
+
+---
+
+## Google Workspace MCP
+
+| Servicio | Transporte | Paquete | Autenticación |
+|---|---|---|---|
+| Calendar | stdio | `@cocal/google-calendar-mcp` | `GOOGLE_OAUTH_CREDENTIALS` + `.calendar-token.json` |
+| Gmail | HTTP+Bearer | servidor externo | `GMAIL_MCP_URL` + Bearer token OAuth2 dinámico |
+| Drive | stdio | `@modelcontextprotocol/server-gdrive` | `GOOGLE_OAUTH_CREDENTIALS` + `.drive-token.json` |
+
+Los ficheros de token en `data/google/` se generan automáticamente al arrancar AETHERIS a partir de `GOOGLE_REFRESH_TOKEN`. Solo es necesario ejecutar `npx ... auth` una vez para obtener el refresh token inicial.
 
 ---
 
@@ -212,7 +248,7 @@ aetheris/
 ├── agent/          # StateGraph LangGraph, nodos, aristas, prompts
 ├── guardrails/     # Filtrado de seguridad entrada/salida (EN+ES)
 ├── rag/            # Ingesta, recuperación, cadena RAG
-├── mcp/            # Cliente MCP (Tavily 5 tools + Google Calendar/Gmail)
+├── mcp_tools/      # Cliente MCP (Tavily + Calendar/Gmail/Drive) + auth Google OAuth2
 ├── memory/         # mem0 (corto plazo) + SQLite/Chroma (largo plazo)
 ├── observability/  # Helpers de trazado LangSmith
 ├── api/            # Backend FastAPI (routers, schemas, middleware)
@@ -237,6 +273,7 @@ aetheris/
 | POST | `/api/v1/speech/transcribe` | Transcribir audio (faster-whisper) |
 | GET | `/api/v1/health` | Estado del sistema |
 | GET | `/api/v1/health/langsmith` | Conectividad con LangSmith |
+| GET | `/api/v1/health/google` | Estado de credenciales y tools Google MCP |
 
 Documentación interactiva disponible en [http://localhost:8000/docs](http://localhost:8000/docs).
 

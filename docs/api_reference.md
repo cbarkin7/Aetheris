@@ -287,6 +287,36 @@ Comprueba la conectividad con LangSmith.
 
 ---
 
+### `GET /api/v1/health/google`
+
+Diagnóstico del estado de credenciales Google y herramientas MCP Google cargadas.
+
+**Respuesta (200 OK):**
+```json
+{
+  "status": "ok",
+  "credentials": {
+    "client_secret_file_exists": true,
+    "refresh_token_set": true,
+    "calendar_token_exists": true,
+    "gmail_token_exists": true
+  },
+  "mcp": {
+    "tools_loaded": 42,
+    "google_tools": ["list-calendars", "create-event", "list_files", "..."],
+    "clients_alive": 3
+  }
+}
+```
+
+| Campo `status` | Significado |
+|---|---|
+| `"ok"` | Credenciales configuradas y tools Google cargadas |
+| `"partial"` | Credenciales OK pero ninguna tool Google disponible |
+| `"error"` | Faltan credenciales (sin `client_secret_file` o sin `refresh_token`) |
+
+---
+
 ## Resumen de Endpoints
 
 | Método | Endpoint | Descripción |
@@ -302,6 +332,7 @@ Comprueba la conectividad con LangSmith.
 | `POST` | `/api/v1/speech/transcribe` | Transcribir audio a texto (faster-whisper) |
 | `GET` | `/api/v1/health` | Estado general del sistema |
 | `GET` | `/api/v1/health/langsmith` | Conectividad con LangSmith |
+| `GET` | `/api/v1/health/google` | Estado de credenciales y tools Google MCP |
 
 ---
 

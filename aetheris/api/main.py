@@ -41,16 +41,21 @@ async def lifespan(app: FastAPI):
     logger.debug("[SISTEMA] → directorios de datos | verificados")
 
     # 3. Start MCP servers and load tools
+    # get_mcp_tools() devuelve (clients, tools). Los clientes DEBEN guardarse en
+    # app.state: si son GC'd, la conexión stdio al proceso npx se cierra y
+    # tool.ainvoke() falla aunque las tools parezcan cargadas.
+    mcp_clients: list = []
     mcp_tools: list = []
     logger.info("[MCP] → get_mcp_tools | inicio")
     try:
-        from aetheris.mcp.client import get_mcp_tools
-        mcp_tools = await get_mcp_tools()
-        logger.info("[MCP] → get_mcp_tools | completado | tools=%d nombres=%s",
-                    len(mcp_tools), [t.name for t in mcp_tools])
+        from aetheris.mcp_tools.client import get_mcp_tools
+        mcp_clients, mcp_tools = await get_mcp_tools()
+        logger.info("[MCP] → get_mcp_tools | completado | clients=%d tools=%d nombres=%s",
+                    len(mcp_clients), len(mcp_tools), [t.name for t in mcp_tools])
     except Exception as exc:
         logger.warning("[MCP] → get_mcp_tools | fallido (continuando sin herramientas) | error=%s", exc)
 
+    app.state.mcp_clients = mcp_clients   # mantiene los procesos npx vivos
     app.state.mcp_tools = mcp_tools
 
     # 4. Build and compile the LangGraph agent
@@ -112,7 +117,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
+    # Shutdown — liberar clientes MCP (cierra conexiones stdio a los procesos npx)
+    for _client in getattr(app.state, "mcp_clients", []):
+        try:
+            if hasattr(_client, "aclose"):
+                await _client.aclose()
+        except Exception:
+            pass
     logger.info("[SISTEMA] → lifespan | apagado | AETHERIS detenido")
 
 

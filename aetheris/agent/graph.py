@@ -125,7 +125,11 @@ def build_graph(mcp_tools: list | None = None, checkpointer=None) -> CompiledSta
     builder.add_conditional_edges(
         "hitl_node",
         route_after_hitl_node,
-        {"hitl_wait_node": "hitl_wait_node", "llm_node": "llm_node"},
+        {
+            "hitl_wait_node": "hitl_wait_node",    # acciones destructivas → interrupt
+            "google_action_node": "google_action_node",  # lecturas → auto-ejecutar
+            "llm_node": "llm_node",                # sin acciones → respuesta directa
+        },
     )
     # hitl_wait_node es el punto de interrupción real (interrupt_before).
     # Al reanudar, route_after_hitl evalúa hitl_approved y enruta.

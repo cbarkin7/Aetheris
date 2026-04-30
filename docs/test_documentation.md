@@ -41,7 +41,7 @@ Tests que usan Chroma real (en `/tmp`) y SQLite real, pero simulan las APIs exte
 | `test_agent_graph.py` | Compilación del grafo con `hitl_wait_node`, invocación de un turno, persistencia de checkpoint |
 | `test_api_chat.py` | Endpoints de salud, memoria y chat; evento `conversation_id` como primer SSE; filtrado SSE por nodo (`llm_node`); evento `guardrail_blocked`; flujo HITL completo (hitl_required → resume → action_result) |
 | `test_api_documents.py` | Endpoints de subida, listado y eliminación de documentos |
-| `test_mcp_tools.py` | Configuración de servidores MCP (`tavily-mcp`, `@cocal/google-calendar-mcp`, `@gongrzhe/server-gmail-autoauth-mcp`), degradación sin claves, nueva API sin `async with`, `google_available` basado en fichero |
+| `test_mcp_tools.py` | Configuración de servidores MCP (`tavily-mcp`, `@cocal/google-calendar-mcp`, Gmail HTTP, `@modelcontextprotocol/server-gdrive`), degradación sin claves, `get_mcp_tools()` devuelve `(clients, tools)`, `google_available` basado en fichero |
 
 **Ejecutar:**
 ```bash
@@ -154,7 +154,7 @@ Validan el mecanismo completo de aprobación Human-in-the-Loop:
 4. El stream de reanudación emite `action_result` por cada acción ejecutada, seguido de `token` y `done`
 5. Con `{"approved": false}` → el grafo va a `llm_node` directamente con un aviso de rechazo
 
-**Caso sin acciones destructivas:** cuando `hitl_node` detecta solo herramientas de lectura (ej. `list-events`), `pending=[]` → el nodo NO añade `AIMessage` con `tool_calls` al estado → el grafo NO pausa → el LLM responde sin interrupción.
+**Caso lecturas Google (sin HITL modal):** cuando `hitl_node` detecta herramientas de lectura (ej. `list-events`, `list_files`), fija `hitl_approved=True` → `route_after_hitl_node` enruta directo a `google_action_node` sin pasar por `hitl_wait_node` → la acción se ejecuta automáticamente sin interrupción ni modal.
 
 ---
 

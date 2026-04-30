@@ -109,11 +109,15 @@ _HITL_DESTRUCTIVE_ACTIONS = frozenset({
     "send_gmail",
     "reply_to_email",
     "create_draft",
-    # --- Drive (futuro) ---
+    # --- @modelcontextprotocol/server-gdrive ---
     "delete-file",
     "move-file",
+    "share-file",
+    "rename-file",
     "delete_file",
     "move_file",
+    "share_file",
+    "rename_file",
 })
 
 # Singletons de guardrails (inicialización perezosa)
@@ -696,10 +700,32 @@ def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
         # con los ToolMessages correspondientes.
         return {"tool_calls_pending": pending, "messages": [response]}
 
-    # Sin acciones destructivas: NO añadir el AIMessage con tool_calls al historial.
-    # Si se añadiera sin los ToolMessages de respuesta, OpenAI devolvería 400
-    # ("tool_calls must be followed by tool messages").
-    # El grafo continúa hacia llm_node que genera la respuesta final.
+    # Sin acciones destructivas (lecturas: list_events, list_calendars, read_email, etc.)
+    # → auto-aprobar y ejecutar directamente en google_action_node sin interrupción HITL.
+    # hitl_approved=True hace que route_after_hitl_node salte hitl_wait_node.
+    if tool_calls:
+        non_destructive = [
+            {
+                "id": tc.get("id", tc["name"]),
+                "name": tc["name"],
+                "args": tc["args"],
+                "description": f"Lectura: {tc['name']}",
+            }
+            for tc in tool_calls
+        ]
+        logger.info(
+            "[HITL] → hitl_node | acciones de lectura auto-aprobadas=%d | %s",
+            len(non_destructive), [p["name"] for p in non_destructive],
+        )
+        # El AIMessage con tool_calls DEBE añadirse al historial para que
+        # google_action_node pueda completar el intercambio con ToolMessages.
+        return {
+            "tool_calls_pending": non_destructive,
+            "hitl_approved": True,
+            "messages": [response],
+        }
+
+    # Sin ninguna tool call generada
     return {"tool_calls_pending": []}
 
 
@@ -771,7 +797,12 @@ async def google_action_node(state: AgentState, mcp_tools: list | None = None) -
         "[GOOGLE] → google_action_node | completado | ok=%d/%d",
         ok_count, len(pending),
     )
-    return {"messages": result_messages, "tool_calls_pending": [], "action_results": action_results}
+    return {
+        "messages": result_messages,
+        "tool_calls_pending": [],
+        "hitl_approved": None,   # reset para que el siguiente turno empiece limpio
+        "action_results": action_results,
+    }
 
 
 # ---------------------------------------------------------------------------

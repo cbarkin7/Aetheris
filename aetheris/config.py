@@ -87,6 +87,10 @@ class Settings(BaseSettings):
         default="data/google",
         description="Directorio donde se escriben los ficheros de token authorized_user",
     )
+    gmail_mcp_url: str = Field(
+        default="http://localhost:30000/mcp",
+        description="URL del servidor Gmail MCP HTTP (Bearer auth)",
+    )
 
     # -------------------------------------------------------------------------
     # Mem0 (memoria conversacional)

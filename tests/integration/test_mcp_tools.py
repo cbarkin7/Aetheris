@@ -13,8 +13,9 @@ async def test_get_mcp_tools_no_keys_returns_empty(monkeypatch, override_setting
     from aetheris.config import get_settings
     get_settings.cache_clear()
 
-    from aetheris.mcp.client import get_mcp_tools
-    tools = await get_mcp_tools()
+    from aetheris.mcp_tools.client import get_mcp_tools
+    clients, tools = await get_mcp_tools()
+    assert clients == []
     assert tools == []
     get_settings.cache_clear()
 
@@ -34,10 +35,11 @@ async def test_get_mcp_tools_calls_get_tools_directly(monkeypatch, override_sett
     mock_client.get_tools = AsyncMock(return_value=[mock_tool])
 
     with patch("langchain_mcp_adapters.client.MultiServerMCPClient", return_value=mock_client):
-        from aetheris.mcp.client import get_mcp_tools
-        tools = await get_mcp_tools()
+        from aetheris.mcp_tools.client import get_mcp_tools
+        clients, tools = await get_mcp_tools()
 
     mock_client.get_tools.assert_called_once()
+    assert len(clients) == 1
     assert tools == [mock_tool]
     get_settings.cache_clear()
 
@@ -48,7 +50,7 @@ def test_tavily_server_config_contains_api_key(monkeypatch):
     from aetheris.config import get_settings
     get_settings.cache_clear()
 
-    from aetheris.mcp.tavily_tools import get_tavily_server_config
+    from aetheris.mcp_tools.tavily_tools import get_tavily_server_config
     config = get_tavily_server_config()
     assert config["env"]["TAVILY_API_KEY"] == "tvly-test-key"
     assert "npx" in config["command"]
@@ -63,7 +65,7 @@ def test_google_server_config_contains_credentials(monkeypatch):
     from aetheris.config import get_settings
     get_settings.cache_clear()
 
-    from aetheris.mcp.google_tools import get_google_server_config
+    from aetheris.mcp_tools.google_tools import get_google_server_config
     config = get_google_server_config()
     assert config["env"]["GOOGLE_CLIENT_ID"] == "client-id"
     assert config["env"]["GOOGLE_REFRESH_TOKEN"] == "refresh-token"
