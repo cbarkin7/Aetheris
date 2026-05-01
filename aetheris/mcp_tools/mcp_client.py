@@ -9,17 +9,34 @@ def get_project_root() -> Path:
 
 
 def get_google_env() -> dict:
+    """
+    Construye el dict de variables de entorno para los servidores MCP de Google.
+
+    Variables clave:
+    - GOOGLE_OAUTH_CREDENTIALS         → client_secret JSON para @cocal/google-calendar-mcp
+    - GOOGLE_CALENDAR_MCP_TOKEN_PATH   → token Calendar (formato {"normal": {...}})
+    - GOOGLE_DRIVE_OAUTH_CREDENTIALS   → client_secret JSON para @piotr-agier/google-drive-mcp
+    - GOOGLE_DRIVE_MCP_TOKEN_PATH      → token Drive (formato authorized_user)
+    - GOOGLE_GMAIL_MCP_TOKEN_PATH      → token Gmail para @gongrzhe/server-gmail-mcp
+    """
+    import json
     root = get_project_root()
+    secret_file = root / "data" / "google" / "client_secret_aetheris.json"
 
     env = os.environ.copy()
-    env["GOOGLE_OAUTH_CREDENTIALS"] = str(
-        root / "data" / "google" / "client_secret_aetheris.json"
-    )
+    env["GOOGLE_OAUTH_CREDENTIALS"] = str(secret_file)
     env["GOOGLE_CALENDAR_MCP_TOKEN_PATH"] = str(
         root / "data" / "google" / ".calendar-token.json"
     )
+    # @piotr-agier/google-drive-mcp usa:
+    #   GOOGLE_DRIVE_OAUTH_CREDENTIALS → client_secret JSON (para el flujo OAuth2)
+    #   GOOGLE_DRIVE_MCP_TOKEN_PATH    → token guardado en formato authorized_user
+    env["GOOGLE_DRIVE_OAUTH_CREDENTIALS"] = str(secret_file)
     env["GOOGLE_DRIVE_MCP_TOKEN_PATH"] = str(
         root / "data" / "google" / ".drive-token.json"
+    )
+    env["GOOGLE_GMAIL_MCP_TOKEN_PATH"] = str(
+        root / "data" / "google" / ".gmail-token.json"
     )
 
     return env
@@ -47,7 +64,7 @@ def get_mcp_client() -> MultiServerMCPClient:
             "drive": {
                 "transport": "stdio",
                 "command": "cmd",
-                "args": ["/c", "npx", "-y", "@modelcontextprotocol/server-gdrive"],
+                "args": ["/c", "npx", "-y", "@piotr-agier/google-drive-mcp"],
                 "env": google_env,
             },
         }

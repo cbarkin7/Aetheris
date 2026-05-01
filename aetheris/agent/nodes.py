@@ -109,15 +109,37 @@ _HITL_DESTRUCTIVE_ACTIONS = frozenset({
     "send_gmail",
     "reply_to_email",
     "create_draft",
-    # --- @modelcontextprotocol/server-gdrive ---
-    "delete-file",
-    "move-file",
-    "share-file",
-    "rename-file",
-    "delete_file",
-    "move_file",
-    "share_file",
-    "rename_file",
+    # --- @piotr-agier/google-drive-mcp (nombres exactos camelCase) ---
+    # Escritura / modificación de ficheros
+    "uploadFile",
+    "deleteItem",
+    "moveItem",
+    "renameItem",
+    "copyFile",
+    "createTextFile",
+    "updateTextFile",
+    # Google Docs — operaciones destructivas
+    "createGoogleDoc",
+    "insertText",
+    "deleteRange",
+    "applyTextStyle",
+    "insertTable",
+    "addComment",
+    # Google Sheets — operaciones destructivas
+    "createGoogleSheet",
+    "updateGoogleSheet",
+    "appendSpreadsheetRows",
+    "formatGoogleSheetCells",
+    "addDataValidation",
+    # Google Slides — operaciones destructivas
+    "createGoogleSlides",
+    "formatGoogleSlidesText",
+    "setGoogleSlidesBackground",
+    "deleteGoogleSlide",
+    # Calendar duplicado desde Drive MCP (variante camelCase)
+    "createCalendarEvent",
+    "updateCalendarEvent",
+    "deleteCalendarEvent",
 })
 
 # Singletons de guardrails (inicialización perezosa)

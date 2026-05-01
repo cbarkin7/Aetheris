@@ -41,9 +41,19 @@ async def lifespan(app: FastAPI):
     logger.debug("[SISTEMA] → directorios de datos | verificados")
 
     # 3. Start MCP servers and load tools
-    # get_mcp_tools() devuelve (clients, tools). Los clientes DEBEN guardarse en
-    # app.state: si son GC'd, la conexión stdio al proceso npx se cierra y
-    # tool.ainvoke() falla aunque las tools parezcan cargadas.
+    # 3a. Arrancar Gmail MCP HTTP server (proceso local en localhost:30000).
+    #     Debe iniciarse ANTES de get_mcp_tools() para que el cliente HTTP encuentre
+    #     el servidor listo cuando intente conectarse.
+    app.state.gmail_process = None
+    try:
+        from aetheris.mcp_tools.google_tools import start_gmail_mcp_server
+        app.state.gmail_process = await start_gmail_mcp_server()
+    except Exception as exc:
+        logger.warning("[MCP] → start_gmail_mcp_server | fallido (Gmail no disponible) | error=%s", exc)
+
+    # 3b. get_mcp_tools() devuelve (clients, tools). Los clientes DEBEN guardarse en
+    #     app.state: si son GC'd, la conexión stdio al proceso npx se cierra y
+    #     tool.ainvoke() falla aunque las tools parezcan cargadas.
     mcp_clients: list = []
     mcp_tools: list = []
     logger.info("[MCP] → get_mcp_tools | inicio")
@@ -124,6 +134,17 @@ async def lifespan(app: FastAPI):
                 await _client.aclose()
         except Exception:
             pass
+
+    # Shutdown — terminar el proceso Gmail MCP HTTP server
+    _gmail_proc = getattr(app.state, "gmail_process", None)
+    if _gmail_proc is not None:
+        try:
+            _gmail_proc.terminate()
+            _gmail_proc.wait(timeout=5)
+            logger.info("[MCP] → lifespan | Gmail MCP server terminado | pid=%d", _gmail_proc.pid)
+        except Exception as _exc:
+            logger.warning("[MCP] → lifespan | error terminando Gmail MCP server: %s", _exc)
+
     logger.info("[SISTEMA] → lifespan | apagado | AETHERIS detenido")
 
 
