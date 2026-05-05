@@ -5,13 +5,15 @@ Cada nodo recibe AgentState y devuelve un dict parcial de actualización del est
 """
 import json
 import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 logger = logging.getLogger(__name__)
 
 from aetheris.agent.prompts import (
-    HITL_DESCRIPTION_PROMPT,
+    GOOGLE_PLANNER_PROMPT,
     MANAGER_PROMPT,
     RAG_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
@@ -104,11 +106,17 @@ _HITL_DESTRUCTIVE_ACTIONS = frozenset({
     "send-email",
     "reply-to-email",
     "create-draft",
+    "delete-email",
+    "batch-delete-emails",
+    "empty-trash",
     # variantes con guión bajo
     "send_email",
     "send_gmail",
     "reply_to_email",
     "create_draft",
+    "delete_email",
+    "batch_delete_emails",
+    "empty_trash",
     # --- @piotr-agier/google-drive-mcp (nombres exactos camelCase) ---
     # Escritura / modificación de ficheros
     "uploadFile",
@@ -189,6 +197,28 @@ def _find_tool(tools: list, name: str):
 def _find_tool_by_keyword(tools: list, keyword: str):
     """Busca la primera herramienta cuyo nombre contenga la palabra clave."""
     return next((t for t in tools if keyword in t.name.lower()), None)
+
+
+def _apply_sanitized_input(messages: list, sanitized_input: str | None) -> list:
+    """
+    Reemplaza el contenido del último HumanMessage con la versión saneada (PII redactada)
+    ÚNICAMENTE para las llamadas al LLM — los mensajes originales en state.messages
+    NO se modifican y se persisten con los datos reales en el checkpoint.
+
+    Uso: llamar justo antes de invocar el LLM; NO usar para display ni historial.
+    """
+    if not sanitized_input:
+        return messages
+    result = list(messages)
+    for i in range(len(result) - 1, -1, -1):
+        if isinstance(result[i], HumanMessage):
+            original = result[i]
+            result[i] = HumanMessage(
+                content=sanitized_input,
+                id=getattr(original, "id", None),
+            )
+            break
+    return result
 
 
 def _restore_pii(args: dict, pii_map: dict[str, str]) -> dict:
@@ -272,23 +302,30 @@ def input_guardrail_node(state: AgentState) -> dict:
     )
 
     if redacted:
-        # Reemplazar el mensaje original usando el mismo id — add_messages de LangGraph
-        # actualiza en lugar de añadir cuando el id coincide.
-        # pii_map {placeholder→valor_original} se persiste en state para que
-        # google_action_node pueda restaurar los datos reales antes de invocar
-        # herramientas de Google (Gmail, Calendar, Drive).
+        # Almacenar el texto saneado en sanitized_user_input (no en messages).
+        # Los nodos que llaman al LLM (manager, planner, llm_node…) aplican
+        # _apply_sanitized_input() justo antes de invocar, de modo que el LLM
+        # solo ve los placeholders mientras el historial persistido en BD
+        # conserva los datos reales del usuario.
+        # pii_map {placeholder→valor_original} permite restaurar los datos
+        # en google_action_node antes de invocar las tools de Google.
+        logger.info(
+            "[GUARDRAIL-IN] → input_guardrail_node | PII redactada | "
+            "placeholders=%s (mensaje ORIGINAL conservado en historial)",
+            list(result.redactions.keys()),
+        )
         return {
             "guardrail_passed": True,
             "guardrail_violations": list(result.redactions.keys()),
             "pii_map": result.redactions,
-            "messages": [HumanMessage(content=result.sanitized_text, id=last_human.id)],
+            "sanitized_user_input": result.sanitized_text,
         }
 
-    # Sin redacciones: NO devolver pii_map — el valor del checkpoint del turno
-    # anterior debe conservarse para que google_action_node pueda restaurar PII
-    # en turnos de seguimiento ("Vuelve a intentarlo", "añade X", etc.) que no
-    # repiten los datos sensibles pero sí necesitan ejecutar la tool con ellos.
-    return {"guardrail_passed": True, "guardrail_violations": []}
+    # Sin redacciones: limpiar sanitized_user_input del turno anterior para que
+    # los nodos LLM usen el mensaje original directamente (no un texto obsoleto).
+    # NO limpiar pii_map — podría necesitarse en turnos de seguimiento
+    # ("Vuelve a intentarlo") donde el usuario no repite los datos sensibles.
+    return {"guardrail_passed": True, "guardrail_violations": [], "sanitized_user_input": None}
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +379,11 @@ def manager_node(state: AgentState) -> dict:
     )
 
     llm, provider = get_llm()
-    messages_text = _messages_to_text(state["messages"])
+    # Aplicar PII sanitation solo para el LLM — el historial original no se toca
+    _llm_messages = _apply_sanitized_input(
+        list(state["messages"]), state.get("sanitized_user_input")
+    )
+    messages_text = _messages_to_text(_llm_messages)
     # Excluir _mem0_context del user_memory del manager: es un resumen de conversación
     # voluminoso (pipe-separated) útil para llm_node pero que contamina el contexto
     # de enrutamiento con historial irrelevante para decidir el plan de herramientas.
@@ -382,32 +423,59 @@ def manager_node(state: AgentState) -> dict:
     # El LLM tiende a elegir plain_llm cuando no detecta señales explícitas.
     # La override se aplica en cascada con prioridad decreciente:
     #
-    # 1. Si el intent previo del checkpoint era google_action → mantenerlo.
+    # 1. Si el último mensaje contiene palabras clave inequívocas de Google Workspace
+    #    → forzar google_action. Evita que la rag-override capture operaciones de Drive
+    #    que el LLM malclasificó como plain_llm (ej. "mueve el documento a la carpeta X").
+    #
+    # 2. Si el intent previo del checkpoint era google_action → mantenerlo.
     #    Cubre "Vuelve a intentarlo", "inténtalo de nuevo", "añade X y reintenta"
     #    donde el usuario continúa una acción de Google sin repetir los datos.
     #
-    # 2. Si Chroma tiene fragmentos → forzar rag.
+    # 3. Si Chroma tiene fragmentos → forzar rag.
     #    Cubre preguntas factuales donde el LLM no sabe qué hay en los documentos.
+    #    SOLO aplica si las reglas 1 y 2 no han disparado.
+    _GOOGLE_ACTION_KEYWORDS = {
+        # Drive
+        "drive", "carpeta", "archivo", "fichero", "hoja de cálculo", "spreadsheet",
+        "mueve", "mover", "copia", "copiar", "sube", "subir", "descarga", "descargar",
+        "renombra", "renombrar", "elimina archivos", "borra archivos",
+        "crea carpeta", "crea un doc", "crea un documento", "crea una hoja",
+        "createfolder", "createfile", "uploadfile",
+        # Calendar
+        "calendar", "evento", "cita", "reunión", "reunion",
+        # Gmail
+        "gmail", "correo", "email", "bandeja", "borrador",
+    }
     if steps == ["plain_llm"]:
-        prev_intent = state.get("intent", "")
-        if prev_intent == "google_action":
+        last_human_msg = _last_human(state["messages"])
+        last_text = (last_human_msg.content if last_human_msg and isinstance(last_human_msg.content, str) else "").lower()
+
+        if any(kw in last_text for kw in _GOOGLE_ACTION_KEYWORDS):
             steps = ["google_action"]
             logger.info(
-                "[MANAGER] → manager_node | plain_llm→google_action (override) | "
-                "contexto de acción Google activo en checkpoint"
+                "[MANAGER] → manager_node | plain_llm→google_action (keyword-override) | "
+                "mensaje contiene palabras clave de Google Workspace"
             )
         else:
-            try:
-                from aetheris.rag.retriever import get_vectorstore
-                _chroma_count = get_vectorstore()._collection.count()
-                if _chroma_count > 0:
-                    steps = ["rag"]
-                    logger.info(
-                        "[MANAGER] → manager_node | plain_llm→rag (override) | %d fragmentos en Chroma",
-                        _chroma_count,
-                    )
-            except Exception:
-                pass  # Si Chroma no está disponible, mantener plain_llm
+            prev_intent = state.get("intent", "")
+            if prev_intent == "google_action":
+                steps = ["google_action"]
+                logger.info(
+                    "[MANAGER] → manager_node | plain_llm→google_action (override) | "
+                    "contexto de acción Google activo en checkpoint"
+                )
+            else:
+                try:
+                    from aetheris.rag.retriever import get_vectorstore
+                    _chroma_count = get_vectorstore()._collection.count()
+                    if _chroma_count > 0:
+                        steps = ["rag"]
+                        logger.info(
+                            "[MANAGER] → manager_node | plain_llm→rag (override) | %d fragmentos en Chroma",
+                            _chroma_count,
+                        )
+                except Exception:
+                    pass  # Si Chroma no está disponible, mantener plain_llm
     # ─────────────────────────────────────────────────────────────────────────
 
     # Fix 3: "plain_llm" como segundo paso es inválido.
@@ -431,12 +499,16 @@ def manager_node(state: AgentState) -> dict:
     # Fix 1: Limpiar contextos del turno anterior para evitar contaminación
     # entre preguntas (state bleed). web_context y rag_context son propios de
     # cada turno y no deben persistir en el checkpointer entre turnos.
+    # google_action_iterations se resetea aquí para que cada nuevo turno
+    # empiece con el contador a 0 (el bucle es por turno, no global).
     return {
         "intent": first_step,
         "execution_plan": remaining,
         "llm_provider": provider,
-        "web_context": None,  # Fix 1: limpiar entre turnos
-        "rag_context": [],    # Fix 1: limpiar entre turnos
+        "web_context": None,            # Fix 1: limpiar entre turnos
+        "rag_context": [],              # Fix 1: limpiar entre turnos
+        "google_action_iterations": 0,  # Reset bucle google por turno
+        "tool_calls_queue": [],         # Reset cola HITL entre turnos
     }
 
 
@@ -524,6 +596,8 @@ async def web_search_node(state: AgentState, mcp_tools: list | None = None) -> d
 
     last_human = _last_human(state["messages"])
     query = last_human.content if last_human else ""
+    # Para el selector LLM y los args de Tavily usar la versión saneada si existe
+    query = state.get("sanitized_user_input") or query
 
     # ── Selección de herramienta via LLM ────────────────────────────────────
     tool_descriptions = "\n".join(
@@ -633,122 +707,600 @@ async def web_search_node(state: AgentState, mcp_tools: list | None = None) -> d
 
 
 # ---------------------------------------------------------------------------
-# Nodo: hitl_node
+# Helpers de categorización de herramientas Google por dominio
 # ---------------------------------------------------------------------------
 
-def hitl_node(state: AgentState, mcp_tools: list | None = None) -> dict:
+def _build_current_date_str() -> str:
+    """Construye el string de fecha/hora actual con rangos de semana para el prompt."""
+    _now = datetime.now(tz=ZoneInfo("Europe/Madrid"))
+    _wd = _now.weekday()  # 0=lunes … 6=domingo
+    _mon_this = (_now - timedelta(days=_wd)).replace(hour=0, minute=0, second=0, microsecond=0)
+    _sun_this = _mon_this + timedelta(days=6)
+    _mon_next = _mon_this + timedelta(days=7)
+    _sun_next = _mon_next + timedelta(days=6)
+    _fri_next = _mon_next + timedelta(days=4)
+    return (
+        f"{_now.strftime('%A, %d de %B de %Y')} — {_now.strftime('%H:%M')} (Europe/Madrid)\n"
+        f"  · Semana actual    : lunes {_mon_this.strftime('%d/%m/%Y')} – domingo {_sun_this.strftime('%d/%m/%Y')}\n"
+        f"  · Próxima semana   : lunes {_mon_next.strftime('%d de %B')} – domingo {_sun_next.strftime('%d de %B de %Y')}\n"
+        f"  · Próxima sem. lab.: lunes {_mon_next.strftime('%d/%m/%Y')} – viernes {_fri_next.strftime('%d/%m/%Y')}"
+    )
+
+
+def _categorize_google_tools(tools: list) -> dict[str, list]:
     """
-    Prepara tool_calls_pending con descripción legible de cada acción destructiva.
-    El grafo pausa con interrupt_after DESPUÉS de este nodo: on_chain_end llega
-    al SSE y el frontend muestra el modal de confirmación con las descripciones.
+    Separa las herramientas Google en tres dominios: calendar, gmail, drive.
+
+    La separación es estricta: ninguna herramienta pertenece a dos dominios.
+    Esto evita que el LLM confunda herramientas entre servicios (p.ej. llamar
+    a search-events de Calendar para buscar archivos en Drive).
+    """
+    calendar_tools: list = []
+    gmail_tools: list = []
+    drive_tools: list = []
+    for t in tools:
+        name = t.name.lower()
+        if any(kw in name for kw in ("event", "calendar")):
+            calendar_tools.append(t)
+        elif any(kw in name for kw in ("email", "gmail", "mail", "draft")):
+            gmail_tools.append(t)
+        else:
+            drive_tools.append(t)
+    return {"calendar": calendar_tools, "gmail": gmail_tools, "drive": drive_tools}
+
+
+def _detect_relevant_domains(messages: list) -> set[str]:
+    """
+    Detecta qué dominios Google (calendar/gmail/drive) son relevantes para
+    la petición actual.
+
+    Estrategia de dos fases para evitar que contexto de acciones anteriores
+    (ToolMessages de otros dominios) contamine la petición actual:
+
+    FASE 1 — Último mensaje humano (fuente de verdad principal).
+      Si el usuario menciona explícitamente palabras de un dominio, se usa
+      SOLO ese dominio, sin importar el historial de herramientas reciente.
+
+    FASE 2 — ToolMessages recientes (solo si la Fase 1 no detecta nada).
+      Útil para continuaciones multi-paso donde el usuario dice cosas como
+      "ahora elimínalo" sin especificar qué servicio, y la acción anterior
+      (un search, por ejemplo) indica el dominio activo.
+    """
+    last_human = _last_human(messages)
+    user_text = (
+        last_human.content if last_human and isinstance(last_human.content, str) else ""
+    ).lower()
+
+    # ── FASE 1: dominio desde el último mensaje del usuario ──────────────────
+    domains: set[str] = set()
+
+    if any(kw in user_text for kw in (
+        "evento", "cita", "reunión", "reunion", "calendar", "event", "agenda",
+    )):
+        domains.add("calendar")
+
+    if any(kw in user_text for kw in (
+        "email", "correo", "gmail", "mail", "draft",
+        "envía", "envia", "enviar", "bandeja", "asunto",
+        "borrador de correo", "borrador de email", "borrador del correo",
+    )):
+        domains.add("gmail")
+
+    if any(kw in user_text for kw in (
+        "archivo", "fichero", "carpeta", "folder", "drive",
+        "documento", "doc", "hoja", "sheet", "spreadsheet", "slide",
+        "sube", "subir", "descarga", "descargar", "mueve", "mover",
+        "copia", "copiar", "renombra", "renombrar",
+    )):
+        domains.add("drive")
+
+    # Si el mensaje actual indica claramente uno o más dominios → usarlos solo.
+    # Los ToolMessages de acciones anteriores NO deben contaminar esta petición.
+    if domains:
+        return domains
+
+    # ── FASE 2: fallback — continuaciones ("ahora elimínalo", "hazlo", etc.) ──
+    # Solo se activa cuando el mensaje del usuario no menciona ningún dominio.
+    # Se miran los ToolMessages recientes para inferir el dominio activo.
+    for m in reversed(messages[-8:]):
+        if not (isinstance(m, ToolMessage) and isinstance(m.content, str)):
+            continue
+        tool_text = m.content.lower()[:300]
+
+        if any(kw in tool_text for kw in ("event", "calendar", "vcalendar")):
+            domains.add("calendar")
+        if any(kw in tool_text for kw in ("email", "gmail", "message-id", "subject")):
+            domains.add("gmail")
+        if any(kw in tool_text for kw in (
+            "fileid", "file_id", "mimetype", "drive", "folder",
+            "google-apps", "spreadsheet", "document",
+        )):
+            domains.add("drive")
+
+        if domains:
+            break  # con un ToolMessage relevante es suficiente
+
+    if not domains:
+        domains = {"calendar", "gmail", "drive"}
+
+    return domains
+
+
+def _fix_folder_creation_tools(tool_calls: list, messages: list) -> list:
+    """
+    Corrección determinista: reemplaza createGoogleDoc / createGoogleSheet por
+    createFolder cuando el LLM los usa para crear directorios.
+
+    La heurística se activa cuando:
+    1. El último mensaje humano contiene palabras clave de carpeta/directorio.
+    2. El tool_call no lleva contenido sustancial (no es realmente un documento).
+
+    Esto evita fallos silenciosos donde el agente "crea" un documento vacío
+    en lugar de la carpeta solicitada, sin depender de que el LLM siga el prompt.
+    """
+    last_human = _last_human(messages)
+    user_text = (
+        last_human.content if last_human and isinstance(last_human.content, str) else ""
+    ).lower()
+
+    folder_keywords = ("carpeta", "folder", "directorio", "directory")
+    if not any(kw in user_text for kw in folder_keywords):
+        return tool_calls  # El usuario no pide carpeta → no tocar
+
+    fixed = []
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        args = tc.get("args", {}) or {}
+
+        if name in ("createGoogleDoc", "createGoogleSheet"):
+            content = str(args.get("content", args.get("body", ""))).strip()
+            # Sin contenido sustancial → el LLM quería una carpeta, no un documento
+            if len(content) < 20:
+                folder_name = args.get("title", args.get("name", "Nueva carpeta"))
+                parent_id = args.get("folderId", args.get("parentFolderId"))
+                new_args: dict = {"name": folder_name}
+                if parent_id:
+                    new_args["parentFolderId"] = parent_id
+                logger.info(
+                    "[PLANNER] _fix_folder_creation_tools | %s → createFolder | "
+                    "name=%r parent=%r",
+                    name, folder_name, parent_id,
+                )
+                fixed.append({**tc, "name": "createFolder", "args": new_args})
+                continue
+
+        fixed.append(tc)
+
+    return fixed
+
+
+_LIST_TOOLS_WITH_QUERY = frozenset({
+    "listGoogleDocs", "listGoogleSheets", "listGoogleSlides",
+    "listFolder", "search",
+})
+
+
+def _fix_list_tools(tool_calls: list) -> list:
+    """
+    La API de Google Drive no admite orderBy cuando la query contiene fullText.
+    Si el LLM genera una llamada a listGoogleDocs/Sheets/Slides/search con
+    un término fullText Y un parámetro orderBy, eliminar orderBy para evitar
+    el error "Sorting is not supported for queries with fullText terms".
+    """
+    fixed = []
+    for tc in tool_calls:
+        if tc.get("name", "") not in _LIST_TOOLS_WITH_QUERY:
+            fixed.append(tc)
+            continue
+
+        args = dict(tc.get("args", {}) or {})
+        query = str(args.get("query", "")).lower()
+        has_fulltext = "fulltext" in query or "contains" in query
+
+        if has_fulltext and "orderBy" in args:
+            logger.info(
+                "[PLANNER] _fix_list_tools | '%s' | fullText + orderBy → eliminando orderBy",
+                tc["name"],
+            )
+            args.pop("orderBy")
+            fixed.append({**tc, "args": args})
+        else:
+            fixed.append(tc)
+
+    return fixed
+
+
+def _looks_like_drive_id(value: str) -> bool:
+    """
+    Heurística: un Drive file ID real tiene ≥ 25 caracteres alfanuméricos
+    (más guiones y guiones bajos), sin espacios ni puntos.
+    Un nombre de fichero ("prueba_v1.txt", "Mi Informe Final") no cumple esto.
+    """
+    return (
+        len(value) >= 25
+        and " " not in value
+        and "." not in value
+        and all(c.isalnum() or c in "-_" for c in value)
+    )
+
+
+def _fix_delete_tools(tool_calls: list, messages: list) -> list:
+    """
+    Corrección determinista pre-HITL para operaciones de borrado en Drive.
+
+    Regla invariante: SIEMPRE hay que buscar el archivo antes de borrarlo.
+    Si el LLM genera un borrado con un nombre de fichero en lugar de un Drive ID,
+    se convierte en una búsqueda primero. El planner volverá a llamarse con el
+    resultado de la búsqueda y generará el deleteItem con el ID real.
+
+    Casos corregidos:
+    1. deleteItem(fileId=<nombre>) → search(query="name='<nombre>'")
+       Solo se deja pasar deleteItem si fileId ya es un Drive ID real (≥ 25 chars).
+    2. deleteGoogleSlide sin slideObjectId → mismo tratamiento:
+       · Con Drive ID en presentationId → deleteItem(fileId=...)  [ya es el ID real]
+       · Con nombre de fichero → search(query="name='<nombre>'")
+    """
+    fixed = []
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        args = tc.get("args", {}) or {}
+
+        # ── Caso 1: deleteItem con nombre de fichero en fileId ────────────────
+        if name == "deleteItem":
+            file_id = str(args.get("fileId", "")).strip()
+            if file_id and not _looks_like_drive_id(file_id):
+                # fileId parece un nombre → buscar primero
+                logger.info(
+                    "[PLANNER] _fix_delete_tools | deleteItem con nombre '%s' → "
+                    "search para obtener fileId", file_id,
+                )
+                fixed.append({
+                    **tc,
+                    "name": "search",
+                    "args": {"query": f"name='{file_id}'"},
+                })
+                continue
+
+        # ── Caso 2: deleteGoogleSlide sin slideObjectId ───────────────────────
+        elif name == "deleteGoogleSlide":
+            slide_obj_id = str(args.get("slideObjectId", "")).strip()
+            presentation_id = str(args.get("presentationId", "")).strip()
+
+            if not slide_obj_id:
+                # Sin slideObjectId → el LLM confunde "borrar archivo" con
+                # "borrar diapositiva". Redirigir igual que deleteItem.
+                if presentation_id and _looks_like_drive_id(presentation_id):
+                    logger.info(
+                        "[PLANNER] _fix_delete_tools | deleteGoogleSlide sin slideObjectId → "
+                        "deleteItem | fileId=%r", presentation_id,
+                    )
+                    fixed.append({**tc, "name": "deleteItem", "args": {"fileId": presentation_id}})
+                elif presentation_id:
+                    logger.info(
+                        "[PLANNER] _fix_delete_tools | deleteGoogleSlide con nombre '%s' → "
+                        "search para obtener fileId", presentation_id,
+                    )
+                    fixed.append({
+                        **tc,
+                        "name": "search",
+                        "args": {"query": f"name='{presentation_id}'"},
+                    })
+                else:
+                    fixed.append(tc)
+                continue
+
+        fixed.append(tc)
+
+    return fixed
+
+
+def _format_action_description(name: str, args: dict) -> str:
+    """Genera descripción legible de una acción Google sin necesidad de LLM."""
+    short_args = {
+        k: (str(v)[:60] + "…" if len(str(v)) > 60 else v)
+        for k, v in (args or {}).items()
+    }
+    args_str = ", ".join(f"{k}={repr(v)}" for k, v in list(short_args.items())[:4])
+    return f"{name}({args_str})"
+
+
+# ---------------------------------------------------------------------------
+# Nodo: google_planner_node
+# ---------------------------------------------------------------------------
+
+def google_planner_node(state: AgentState, mcp_tools: list | None = None) -> dict:
+    """
+    Nodo experto en planificar acciones de Google Workspace.
+
+    Responsabilidades:
+    1. Filtrar herramientas MCP al dominio relevante (Calendar / Gmail / Drive)
+       para evitar confusión entre servicios.
+    2. Llamar al LLM con las herramientas filtradas y el historial completo.
+    3. Si el LLM devuelve tool_calls → construir tool_calls_pending.
+    4. Si el LLM devuelve texto (sin tool_calls) → la tarea está completa o
+       faltan datos: activar data_collection_required para que llm_node
+       haga pass-through y el mensaje ya añadido llegue al usuario.
+
+    Este nodo NO gestiona la aprobación HITL: eso es responsabilidad de hitl_node.
     """
     user_id = state.get("user_id", "?")
     logger.info(
-        "[HITL] → hitl_node | inicio | user='%s' herramientas_mcp=%d",
+        "[PLANNER] → google_planner_node | inicio | user='%s' herramientas_mcp=%d",
         user_id, len(mcp_tools) if mcp_tools else 0,
     )
 
-    last_human = _last_human(state["messages"])
-    if not last_human or not mcp_tools:
-        logger.warning("[HITL] → hitl_node | sin mensaje o herramientas → informando al usuario")
+    if not mcp_tools:
+        logger.warning("[PLANNER] → google_planner_node | sin herramientas MCP")
         return {
-            "hitl_approved": False,
-            "intent": "plain_llm",
+            "tool_calls_pending": [],
+            "data_collection_required": True,
             "messages": [AIMessage(
-                content="⚠️ Las herramientas de Google Workspace no están disponibles en este momento. "
+                content="⚠️ Las herramientas de Google Workspace no están disponibles. "
                         "Verifica que los servidores MCP estén configurados correctamente."
             )],
         }
 
+    # Filtrar únicamente herramientas Google
     google_tools = [
         t for t in mcp_tools
         if any(kw in t.name.lower() for kw in ("google", "calendar", "gmail", "drive", "event", "email"))
     ]
     if not google_tools:
-        logger.info("[HITL] → hitl_node | sin herramientas Google → informando al usuario")
+        logger.warning("[PLANNER] → google_planner_node | sin herramientas Google activas")
         return {
-            "hitl_approved": False,
-            "intent": "plain_llm",
+            "tool_calls_pending": [],
+            "data_collection_required": True,
             "messages": [AIMessage(
                 content="⚠️ No se encontraron herramientas de Google Workspace activas. "
                         "Comprueba las credenciales OAuth en la configuración."
             )],
         }
 
-    # Invocar LLM con las herramientas para detectar qué acciones quiere ejecutar.
-    # _sanitize_tool_calls es obligatorio: en turnos posteriores el historial puede
-    # contener AIMessages con tool_calls huérfanos (sin ToolMessage de respuesta)
-    # de intentos anteriores que el usuario amplió con más información.
-    # Sin esto, OpenAI devuelve 400 "tool_calls must be followed by tool messages".
-    logger.info("[HITL] → hitl_node | herramientas_google=%d | detectando acciones", len(google_tools))
-    llm_with_tools, _ = get_llm(tools=google_tools)
-    sanitized_messages = _sanitize_tool_calls(list(state["messages"]))
-    response = llm_with_tools.invoke(sanitized_messages)
+    # Categorizar y seleccionar solo los dominios necesarios para esta petición.
+    # El LLM recibe ÚNICAMENTE las herramientas del dominio relevante, lo que
+    # impide físicamente que llame a search-events (Calendar) para Drive, etc.
+    tool_by_domain = _categorize_google_tools(google_tools)
+    # messages_orig se usa para detección de dominios y para _detect_relevant_domains
+    # (acepta mensajes con datos reales, es operación local).
+    # messages_for_llm aplica PII sanitation para lo que se envía al modelo.
+    messages_orig = list(state["messages"])
+    messages_for_llm = _apply_sanitized_input(messages_orig, state.get("sanitized_user_input"))
+    relevant_domains = _detect_relevant_domains(messages_orig)
+
+    # ── PASO 0 DETERMINÍSTICO ────────────────────────────────────────────────
+    # Comprueba si ya se ejecutó con éxito una acción terminal en esta sesión
+    # (desde el último HumanMessage). Si es así, no hay que planificar más:
+    # generar resumen directamente sin llamar al LLM de nuevo.
+    #
+    # Herramientas "terminales": destruyen, crean o envían algo definitivamente.
+    # Las de búsqueda/lectura NO son terminales (son pasos intermedios).
+    _TERMINAL_TOOL_NAMES = frozenset({
+        # Drive — ficheros y carpetas
+        "deleteItem", "moveItem", "renameItem", "copyFile",
+        "uploadFile", "createFolder", "createTextFile", "updateTextFile",
+        # Google Docs
+        "createGoogleDoc", "insertText", "deleteRange",
+        "applyTextStyle", "insertTable", "addComment",
+        # Google Sheets
+        "createGoogleSheet", "updateGoogleSheet", "appendSpreadsheetRows",
+        "formatGoogleSheetCells", "addDataValidation",
+        # Google Slides
+        "createGoogleSlides", "deleteGoogleSlide",
+        "formatGoogleSlidesText", "setGoogleSlidesBackground",
+        # Calendar
+        "create-event", "create-events", "update-event", "delete-event",
+        "respond-to-event", "createCalendarEvent", "updateCalendarEvent",
+        "deleteCalendarEvent",
+        # Gmail
+        "send-email", "reply-to-email", "create-draft",
+        "delete-email", "batch-delete-emails", "empty-trash",
+        "send_email", "reply_to_email", "create_draft",
+        "delete_email", "batch_delete_emails", "empty_trash",
+    })
+
+    # Buscar ToolMessages exitosos/fallidos desde el último HumanMessage
+    _last_human_idx = max(
+        (i for i, m in enumerate(messages_orig) if isinstance(m, HumanMessage)),
+        default=0,
+    )
+    _recent = messages_orig[_last_human_idx + 1:]
+    _successful_terminals = [
+        m for m in _recent
+        if isinstance(m, ToolMessage)
+        and getattr(m, "name", "") in _TERMINAL_TOOL_NAMES
+        and not str(getattr(m, "content", "")).startswith("Error:")
+    ]
+    _failed_recent = [
+        m for m in _recent
+        if isinstance(m, ToolMessage)
+        and str(getattr(m, "content", "")).startswith("Error:")
+    ]
+
+    # ── PASO 0.A — Tarea completada con éxito ────────────────────────────────
+    if _successful_terminals and not _failed_recent:
+        # Todas las acciones terminales ejecutadas con éxito y sin fallos pendientes.
+        # Construir resumen directamente sin llamar al LLM del planificador.
+        _tool_names = [getattr(m, "name", "acción") for m in _successful_terminals]
+        _summaries = [str(getattr(m, "content", ""))[:200] for m in _successful_terminals]
+        _summary_text = "\n".join(
+            f"✅ **{name}** completado:\n> {summary}"
+            for name, summary in zip(_tool_names, _summaries)
+        )
+        logger.info(
+            "[PLANNER] → google_planner_node | PASO 0.A | "
+            "tarea completa | terminales=%s",
+            _tool_names,
+        )
+        return {
+            "messages": [AIMessage(content=_summary_text)],
+            "tool_calls_pending": [],
+            "data_collection_required": True,
+            "hitl_approved": None,
+        }
+
+    # ── FIN PASO 0 DETERMINÍSTICO ────────────────────────────────────────────
+    selected_tools = []
+    for domain in relevant_domains:
+        selected_tools.extend(tool_by_domain.get(domain, []))
+    if not selected_tools:
+        selected_tools = google_tools  # fallback: todos los Google tools
+
+    logger.info(
+        "[PLANNER] → google_planner_node | dominios=%s herramientas_seleccionadas=%d/%d",
+        sorted(relevant_domains), len(selected_tools), len(google_tools),
+    )
+
+    # Llamar al LLM con herramientas filtradas.
+    # _sanitize_tool_calls elimina AIMessages con tool_calls huérfanos (sin ToolMessage
+    # de respuesta) que quedan cuando el usuario rechaza una acción HITL o cuando el
+    # agente es interrumpido. Sin esto, OpenAI devuelve 400.
+    llm_with_tools, _ = get_llm(tools=selected_tools)
+    sanitized_messages = _sanitize_tool_calls(messages_for_llm)
+    system_msg = SystemMessage(
+        content=GOOGLE_PLANNER_PROMPT.format(current_date=_build_current_date_str())
+    )
+    response = llm_with_tools.invoke([system_msg] + sanitized_messages)
     tool_calls = getattr(response, "tool_calls", []) or []
 
-    # Para cada acción destructiva, generar descripción legible con HITL_DESCRIPTION_PROMPT
-    llm, _ = get_llm()
+    if not tool_calls:
+        # El LLM respondió con texto: bien porque la tarea está completa (PASO 0)
+        # o porque faltan datos. En ambos casos, activar data_collection_required
+        # para que llm_node haga pass-through y el mensaje llegue al usuario.
+        logger.info(
+            "[PLANNER] → google_planner_node | sin tool_calls → "
+            "data_collection_required (tarea completa o datos faltantes)"
+        )
+        return {
+            "messages": [response],
+            "tool_calls_pending": [],
+            "data_collection_required": True,
+            "hitl_approved": None,
+        }
+
+    # Correcciones deterministas post-LLM (en orden de aplicación):
+    # 1. createGoogleDoc/Sheet → createFolder cuando el usuario pide una carpeta.
+    tool_calls = _fix_folder_creation_tools(tool_calls, messages_orig)
+    # 2. deleteGoogleSlide sin slideObjectId / deleteItem con nombre → search primero.
+    tool_calls = _fix_delete_tools(tool_calls, messages_orig)
+    # 3. listGoogleDocs/Sheets/search con fullText + orderBy → eliminar orderBy.
+    tool_calls = _fix_list_tools(tool_calls)
+
+    # Construir tool_calls_pending con requires_approval para cada acción
     pending = []
     for tc in tool_calls:
-        if tc["name"] not in _HITL_DESTRUCTIVE_ACTIONS:
-            continue
-        desc_prompt = HITL_DESCRIPTION_PROMPT.format(
-            tool_name=tc["name"],
-            tool_args=json.dumps(tc["args"], ensure_ascii=False),
-        )
-        try:
-            description = llm.invoke([HumanMessage(content=desc_prompt)]).content.strip()
-        except Exception as exc:
-            logger.debug("[HITL] → hitl_node | descripción fallback | %s", exc)
-            description = f"{tc['name']}: {json.dumps(tc['args'], ensure_ascii=False)}"
-
-        # Conservar el id real del tool_call para que google_action_node
-        # pueda crear ToolMessages con tool_call_id correcto (requisito OpenAI).
+        requires_approval = tc["name"] in _HITL_DESTRUCTIVE_ACTIONS
         pending.append({
             "id": tc.get("id", tc["name"]),
             "name": tc["name"],
             "args": tc["args"],
-            "description": description,
+            "requires_approval": requires_approval,
         })
 
     logger.info(
-        "[HITL] → hitl_node | completado | acciones_pendientes=%d | %s",
+        "[PLANNER] → google_planner_node | acciones=%d | %s",
         len(pending), [p["name"] for p in pending],
     )
 
-    if pending:
-        # Hay acciones destructivas: añadir el mensaje del LLM (con tool_calls)
-        # al estado para que google_action_node pueda completar el intercambio
-        # con los ToolMessages correspondientes.
-        return {"tool_calls_pending": pending, "messages": [response]}
+    # El AIMessage con tool_calls DEBE añadirse al historial ahora, para que
+    # google_action_node pueda crear ToolMessages con los tool_call_id correctos
+    # (requisito de la API de OpenAI: cada tool_call debe tener su ToolMessage).
+    return {
+        "messages": [response],
+        "tool_calls_pending": pending,
+        "data_collection_required": False,
+        "hitl_approved": None,  # Reset para que hitl_node evalúe de nuevo
+    }
 
-    # Sin acciones destructivas (lecturas: list_events, list_calendars, read_email, etc.)
-    # → auto-aprobar y ejecutar directamente en google_action_node sin interrupción HITL.
-    # hitl_approved=True hace que route_after_hitl_node salte hitl_wait_node.
-    if tool_calls:
-        non_destructive = [
-            {
-                "id": tc.get("id", tc["name"]),
-                "name": tc["name"],
-                "args": tc["args"],
-                "description": f"Lectura: {tc['name']}",
-            }
-            for tc in tool_calls
-        ]
-        logger.info(
-            "[HITL] → hitl_node | acciones de lectura auto-aprobadas=%d | %s",
-            len(non_destructive), [p["name"] for p in non_destructive],
+
+# ---------------------------------------------------------------------------
+# Nodo: hitl_node
+# ---------------------------------------------------------------------------
+
+def hitl_node(state: AgentState) -> dict:
+    """
+    Gestiona la aprobación HITL de las acciones planificadas por google_planner_node,
+    procesando UNA acción por iteración para que el usuario pueda aprobar o rechazar
+    cada acción individualmente.
+
+    Flujo de entrada:
+    - Desde google_planner_node (primera vez):
+        hitl_approved=None, tool_calls_pending=[A,B,C], tool_calls_queue=[]
+        → combina pending+queue, saca A, pone B,C en queue.
+    - Desde google_action_node (después de ejecutar):
+        hitl_approved=None, tool_calls_pending=[], tool_calls_queue=[B,C]
+        → saca B, pone C en queue.
+    - Desde hitl_wait_node tras rechazo (hitl_approved=False):
+        tool_calls_pending=[A], tool_calls_queue=[B,C]
+        → inyecta ToolMessage de rechazo para A, saca B, pone C en queue.
+
+    Decisión de flujo por acción:
+    - requires_approval=False → auto-aprobar (hitl_approved=True), sin interrupción.
+    - requires_approval=True  → esperar aprobación humana (hitl_approved=None →
+      route_after_hitl_node → hitl_wait_node).
+    """
+    queue = list(state.get("tool_calls_queue", []))
+    pending = list(state.get("tool_calls_pending", []))
+    hitl_approved = state.get("hitl_approved")
+    user_id = state.get("user_id", "?")
+
+    result_messages: list = []
+
+    if hitl_approved is False:
+        # La acción anterior fue rechazada por el usuario.
+        # Inyectar ToolMessage sintético para que OpenAI no rechace el historial
+        # (el AIMessage ya tiene el tool_call_id de esta acción; necesita respuesta).
+        if pending:
+            rejected = pending[0]
+            tc_id = rejected.get("id", rejected.get("name", ""))
+            result_messages.append(ToolMessage(
+                content="Acción rechazada por el usuario.",
+                tool_call_id=tc_id,
+                name=rejected.get("name", ""),
+            ))
+            logger.info(
+                "[HITL] → hitl_node | rechazo | '%s' → ToolMessage sintético | cola=%d",
+                rejected.get("name", ""), len(queue),
+            )
+        # Acción rechazada descartada: continuar con lo que queda en la cola
+        all_remaining = queue
+    else:
+        # Entrada normal: combinar cola existente + pending nuevo (del planificador).
+        # google_action_node ya limpió tool_calls_pending=[], así que en ese caso
+        # pending=[] y solo avanza la cola. Desde el planificador, queue=[] y
+        # pending=[A,B,C], lo que pobla la cola completa.
+        all_remaining = queue + pending
+
+    if not all_remaining:
+        logger.info("[HITL] → hitl_node | sin más acciones en cola → fin del bucle")
+        ret: dict = {"tool_calls_pending": [], "tool_calls_queue": [], "hitl_approved": None}
+        if result_messages:
+            ret["messages"] = result_messages
+        return ret
+
+    # Tomar la primera acción de la cola y poner el resto en tool_calls_queue
+    current = dict(all_remaining[0])
+    remaining_queue = all_remaining[1:]
+
+    if "description" not in current:
+        current["description"] = _format_action_description(
+            current["name"], current.get("args", {})
         )
-        # El AIMessage con tool_calls DEBE añadirse al historial para que
-        # google_action_node pueda completar el intercambio con ToolMessages.
-        return {
-            "tool_calls_pending": non_destructive,
-            "hitl_approved": True,
-            "messages": [response],
-        }
 
-    # Sin ninguna tool call generada
-    return {"tool_calls_pending": []}
+    needs_hitl = current.get("requires_approval", False)
+    logger.info(
+        "[HITL] → hitl_node | acción='%s' | requires_approval=%s | cola_restante=%d | user='%s'",
+        current["name"], needs_hitl, len(remaining_queue), user_id,
+    )
+
+    ret = {
+        "tool_calls_pending": [current],
+        "tool_calls_queue": remaining_queue,
+        # Auto-aprobar lecturas; para destructivas dejar None → hitl_wait_node
+        "hitl_approved": True if not needs_hitl else None,
+    }
+    if result_messages:
+        ret["messages"] = result_messages
+    return ret
 
 
 # ---------------------------------------------------------------------------
@@ -810,20 +1362,69 @@ async def google_action_node(state: AgentState, mcp_tools: list | None = None) -
             logger.info("[GOOGLE] → google_action_node | tool='%s' → completado", call["name"])
         except Exception as exc:
             error_msg = str(exc)
+            # Detectar fallo de auth en herramientas Gmail (token Bearer expirado ~1h).
+            # Si el error contiene "401", "auth", "token" o "unauthorized", intentar
+            # refrescar el token y reintentar UNA vez con un cliente Gmail nuevo.
+            _is_gmail = any(kw in call["name"].lower() for kw in ("gmail", "email", "mail"))
+            _is_auth_error = any(kw in error_msg.lower() for kw in (
+                "401", "unauthorized", "unauthenticated", "auth", "token", "invalid_grant",
+            ))
+            if _is_gmail and _is_auth_error:
+                logger.warning(
+                    "[GOOGLE] → google_action_node | tool='%s' | fallo de auth Gmail — "
+                    "refrescando token y reintentando",
+                    call["name"],
+                )
+                try:
+                    from aetheris.mcp_tools.google_auth import get_google_access_token
+                    from aetheris.config import get_settings
+                    from langchain_mcp_adapters.client import MultiServerMCPClient
+                    _settings = get_settings()
+                    # Invalidar cache forzando llamada directa
+                    import aetheris.mcp_tools.google_auth as _gauth
+                    _gauth._cached_until = 0  # fuerza refresco en la siguiente llamada
+                    fresh_token = get_google_access_token()
+                    _fresh_client = MultiServerMCPClient({
+                        "gmail": {
+                            "transport": "http",
+                            "url": _settings.gmail_mcp_url,
+                            "headers": {"Authorization": f"Bearer {fresh_token}"},
+                        }
+                    })
+                    _fresh_tools = await _fresh_client.get_tools()
+                    _fresh_tool = next((t for t in _fresh_tools if t.name == call["name"]), None)
+                    if _fresh_tool:
+                        result = await _fresh_tool.ainvoke(exec_args)
+                        summary = str(result)[:300]
+                        result_messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
+                        action_results.append({"ok": True, "name": call["name"], "summary": summary})
+                        logger.info(
+                            "[GOOGLE] → google_action_node | tool='%s' → completado tras refresco de token",
+                            call["name"],
+                        )
+                        continue  # pasar al siguiente tool_call
+                except Exception as retry_exc:
+                    logger.error(
+                        "[GOOGLE] → google_action_node | reintento Gmail fallido | %s", retry_exc
+                    )
+                    error_msg = f"Error de autenticación Gmail (reintento fallido): {retry_exc}"
+
             logger.error("[GOOGLE] → google_action_node | tool='%s' → fallido | %s", call["name"], error_msg)
             result_messages.append(ToolMessage(content=f"Error: {error_msg}", tool_call_id=tc_id))
             action_results.append({"ok": False, "name": call["name"], "error": error_msg})
 
     ok_count = sum(1 for r in action_results if r["ok"])
+    iterations = state.get("google_action_iterations", 0) + 1
     logger.info(
-        "[GOOGLE] → google_action_node | completado | ok=%d/%d",
-        ok_count, len(pending),
+        "[GOOGLE] → google_action_node | completado | ok=%d/%d | iteracion=%d",
+        ok_count, len(pending), iterations,
     )
     return {
         "messages": result_messages,
         "tool_calls_pending": [],
-        "hitl_approved": None,   # reset para que el siguiente turno empiece limpio
+        "hitl_approved": None,   # reset para que el siguiente hitl_node empiece limpio
         "action_results": action_results,
+        "google_action_iterations": iterations,
     }
 
 
@@ -835,7 +1436,18 @@ def llm_node(state: AgentState) -> dict:
     """
     Genera la respuesta final del asistente incorporando contexto RAG,
     resultados de herramientas y memoria del usuario.
+
+    Pass-through cuando data_collection_required=True: hitl_node ya generó
+    la pregunta de datos faltantes y la añadió al historial. El llm_node
+    solo resetea el flag para que el siguiente turno funcione con normalidad.
     """
+    if state.get("data_collection_required"):
+        logger.info(
+            "[LLM] → llm_node | data_collection_required=True → pass-through "
+            "(hitl_node ya preguntó los datos faltantes)"
+        )
+        return {"data_collection_required": False}
+
     user_id = state.get("user_id", "?")
     rag_context = state.get("rag_context", [])
     guardrail_ok = state.get("guardrail_passed")
@@ -912,7 +1524,10 @@ def llm_node(state: AgentState) -> dict:
         (web_context[:200] + "…") if web_context else "None",
     )
 
-    raw_messages = _sanitize_tool_calls(list(state["messages"]))
+    # Aplicar PII sanitation solo para el LLM — el historial original no se toca.
+    # _sanitize_tool_calls también limpia AIMessages huérfanos del historial.
+    _llm_hist = _apply_sanitized_input(list(state["messages"]), state.get("sanitized_user_input"))
+    raw_messages = _sanitize_tool_calls(_llm_hist)
     messages = [SystemMessage(content=system_content)] + raw_messages
     logger.debug("[LLM] → llm_node | invocando LLM | proveedor=%s mensajes_totales=%d", provider, len(messages))
 

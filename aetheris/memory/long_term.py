@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Capa 1: SQLite clave-valor (preferencias de usuario)
 # ---------------------------------------------------------------------------
 
-_DDL = """
+_DDL_USER_MEMORY = """
 CREATE TABLE IF NOT EXISTS user_memory (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     TEXT NOT NULL,
@@ -29,7 +29,17 @@ CREATE TABLE IF NOT EXISTS user_memory (
     value       TEXT NOT NULL,
     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, key)
-);
+)
+"""
+
+_DDL_CONVERSATIONS = """
+CREATE TABLE IF NOT EXISTS conversations (
+    thread_id   TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+)
 """
 
 
@@ -38,7 +48,8 @@ def _connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or settings.sqlite_memory_path
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
-    conn.execute(_DDL)
+    conn.execute(_DDL_USER_MEMORY)
+    conn.execute(_DDL_CONVERSATIONS)
     conn.commit()
     return conn
 
@@ -80,6 +91,130 @@ def delete_user_memory(user_id: str, db_path: str | None = None) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Historial de conversaciones (tabla conversations)
+# ---------------------------------------------------------------------------
+
+def save_conversation(
+    thread_id: str,
+    user_id: str,
+    title: str,
+    db_path: str | None = None,
+) -> None:
+    """
+    Registra o actualiza una conversación en el historial.
+    Si el thread ya existe, actualiza el updated_at (no el título).
+    """
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO conversations (thread_id, user_id, title, created_at, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(thread_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+            """,
+            (thread_id, user_id, title[:120]),
+        )
+        conn.commit()
+    except Exception as exc:
+        logger.debug("save_conversation: no crítico | %s", exc)
+    finally:
+        conn.close()
+
+
+def list_conversations(
+    user_id: str,
+    limit: int = 30,
+    db_path: str | None = None,
+) -> list[dict]:
+    """
+    Devuelve las últimas `limit` conversaciones del usuario, ordenadas por updated_at DESC.
+    Cada elemento: {thread_id, title, created_at, updated_at}
+    """
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT thread_id, title, created_at, updated_at
+            FROM conversations
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+        return [
+            {
+                "thread_id": r[0],
+                "title": r[1],
+                "created_at": r[2],
+                "updated_at": r[3],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def delete_conversation(thread_id: str, db_path: str | None = None) -> dict:
+    """
+    Elimina una conversación del historial Y sus checkpoints LangGraph.
+
+    Borra de dos bases de datos:
+    - memory.db     → tabla `conversations`
+    - checkpoints.db → tablas `checkpoints`, `checkpoint_writes`, `checkpoint_blobs`
+
+    Returns:
+        Dict con `{"memory_deleted": bool, "checkpoints_deleted": bool}`.
+    """
+    settings = get_settings()
+
+    # 1. Eliminar de memory.db
+    conn = _connect(db_path)
+    try:
+        conn.execute("DELETE FROM conversations WHERE thread_id = ?", (thread_id,))
+        conn.commit()
+        memory_deleted = True
+    except Exception as exc:
+        logger.warning("delete_conversation: error en memory.db | %s", exc)
+        memory_deleted = False
+    finally:
+        conn.close()
+
+    # 2. Eliminar checkpoints de checkpoints.db.
+    # Se usa sqlite3 estándar (no aiosqlite) para poder llamar desde código síncrono.
+    # SQLite permite múltiples conexiones simultáneas al mismo fichero; el acceso
+    # de escritura puntual no interfiere con la conexión de lectura/escritura continua
+    # del AsyncSqliteSaver de LangGraph.
+    checkpoints_deleted = False
+    cp_path = settings.sqlite_checkpoints_path
+    if Path(cp_path).exists():
+        try:
+            cp_conn = sqlite3.connect(cp_path, check_same_thread=False, timeout=10)
+            for table in ("checkpoints", "checkpoint_writes", "checkpoint_blobs"):
+                try:
+                    cp_conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
+                except sqlite3.OperationalError:
+                    pass  # tabla no existe aún en esta versión de LangGraph — ignorar
+            cp_conn.commit()
+            cp_conn.close()
+            checkpoints_deleted = True
+            logger.info(
+                "delete_conversation | checkpoints eliminados | thread='%s'", thread_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "delete_conversation: error limpiando checkpoints | thread='%s' | %s",
+                thread_id, exc,
+            )
+
+    logger.info(
+        "delete_conversation | completado | thread='%s' memory=%s checkpoints=%s",
+        thread_id, memory_deleted, checkpoints_deleted,
+    )
+    return {"memory_deleted": memory_deleted, "checkpoints_deleted": checkpoints_deleted}
 
 
 # ---------------------------------------------------------------------------

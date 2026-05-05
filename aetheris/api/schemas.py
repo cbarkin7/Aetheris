@@ -33,6 +33,24 @@ class ChatHistoryResponse(BaseModel):
     messages: list[MessageSchema]
 
 
+class ConversationSummary(BaseModel):
+    thread_id: str
+    title: str
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class ConversationListResponse(BaseModel):
+    user_id: str
+    conversations: list[ConversationSummary]
+
+
+class DeleteConversationResponse(BaseModel):
+    thread_id: str
+    memory_deleted: bool
+    checkpoints_deleted: bool
+
+
 # ---------------------------------------------------------------------------
 # Documents
 # ---------------------------------------------------------------------------

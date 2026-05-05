@@ -243,28 +243,65 @@ def ensure_google_token_files() -> bool:
     return True
 
 
+def _refresh_drive_access_token(client_id: str, client_secret: str, refresh_token: str) -> dict | None:
+    """
+    Solicita un access_token fresco a Google OAuth2 para Drive.
+    Devuelve dict con access_token, expiry_date y token_uri, o None si falla.
+    """
+    import time
+    try:
+        import requests as _requests
+        resp = _requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id":     client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type":    "refresh_token",
+            },
+            timeout=15,
+        )
+        if resp.ok:
+            body = resp.json()
+            expires_in = body.get("expires_in", 3599)
+            return {
+                "access_token": body["access_token"],
+                "expiry_date": int((time.time() + expires_in) * 1000),
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        logger.warning(
+            "[MCP] → _refresh_drive_access_token | fallo HTTP %s: %s",
+            resp.status_code, resp.text[:200],
+        )
+    except Exception as exc:
+        logger.warning("[MCP] → _refresh_drive_access_token | excepcion: %s", exc)
+    return None
+
+
 def ensure_google_drive_token_files() -> bool:
     """
-    Prepara el fichero de token para Google Drive.
+    Prepara el fichero de token para Google Drive con access_token activo.
 
-    @piotr-agier/google-drive-mcp usa @google-cloud/local-auth, que guarda y lee
-    tokens en formato 'authorized_user':
+    @piotr-agier/google-drive-mcp requiere el token en formato 'authorized_user'
+    con access_token y token_uri para NO activar el flujo OAuth interactivo:
         {
           "type": "authorized_user",
           "client_id": "...",
           "client_secret": "...",
-          "refresh_token": "..."
+          "refresh_token": "...",
+          "access_token": "...",     ← requerido para omitir el flujo OAuth
+          "expiry_date": 1234567890,
+          "token_uri": "https://oauth2.googleapis.com/token"
         }
 
-    Este formato es el que google.auth.fromJSON() acepta en @google-cloud/local-auth.
-    El servidor renueva el access_token automáticamente usando el refresh_token.
-
-    Política de escritura: siempre actualizar con el refresh_token actual de .env.
-    Si el fichero ya existe en formato authorized_user con el mismo refresh_token,
-    se reutiliza sin sobreescribir (el servidor podría haberlo actualizado).
+    Política de escritura:
+    - Si el fichero tiene access_token activo y refresh_token coincide → reutilizar.
+    - Si el fichero no tiene access_token o está caducado → refrescar y sobrescribir.
+    - Si el refresco falla → escribir sin access_token (el servidor intentará su propio flujo).
 
     Devuelve True si el fichero está disponible, False en caso contrario.
     """
+    import time as _time
     settings = get_settings()
 
     if not settings.google_refresh_token:
@@ -282,34 +319,51 @@ def ensure_google_drive_token_files() -> bool:
 
     _CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Comprobar si ya existe un fichero authorized_user válido con el mismo refresh_token
+    # Comprobar si ya existe un fichero válido con access_token activo
     if _DRIVE_TOKEN_FILE.exists():
         try:
             existing = json.loads(_DRIVE_TOKEN_FILE.read_text(encoding="utf-8"))
-            if (
-                existing.get("type") == "authorized_user"
-                and existing.get("refresh_token") == settings.google_refresh_token
-            ):
+            rt_matches = existing.get("refresh_token") == settings.google_refresh_token
+            has_access = bool(existing.get("access_token"))
+            # expiry_date está en milisegundos; dejar margen de 5 minutos
+            expiry_ms = existing.get("expiry_date", 0)
+            is_fresh = expiry_ms > (_time.time() + 300) * 1000
+            if existing.get("type") == "authorized_user" and rt_matches and has_access and is_fresh:
                 logger.debug(
                     "[MCP] → ensure_google_drive_token_files | .drive-token.json: "
-                    "authorized_user válido con refresh_token coincidente — reutilizando"
+                    "access_token activo con refresh_token coincidente — reutilizando"
                 )
                 return True
         except Exception:
             pass  # fichero corrupto → reescribir
 
-    # Escribir en formato authorized_user (requerido por @google-cloud/local-auth)
+    # Refrescar access_token para evitar el flujo OAuth interactivo
+    token_extra = _refresh_drive_access_token(client_id, client_secret, settings.google_refresh_token)
+    if token_extra:
+        logger.info(
+            "[MCP] → ensure_google_drive_token_files | access_token obtenido (expira en ~%ds)",
+            (token_extra["expiry_date"] // 1000 - int(_time.time())),
+        )
+    else:
+        logger.warning(
+            "[MCP] → ensure_google_drive_token_files | no se pudo obtener access_token; "
+            "el servidor Drive puede solicitar autorizacion interactiva"
+        )
+        token_extra = {}
+
     drive_token: dict = {
         "type": "authorized_user",
         "client_id": client_id,
         "client_secret": client_secret,
         "refresh_token": settings.google_refresh_token,
+        **token_extra,
     }
 
     _DRIVE_TOKEN_FILE.write_text(json.dumps(drive_token, indent=2), encoding="utf-8")
     logger.info(
         "[MCP] → ensure_google_drive_token_files | .drive-token.json escrito "
-        "(formato authorized_user para @google-cloud/local-auth)"
+        "(formato authorized_user con%s access_token)",
+        "" if token_extra.get("access_token") else " SIN",
     )
     return True
 

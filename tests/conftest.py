@@ -145,6 +145,7 @@ def base_agent_state():
         "intent": "plain_llm",
         "rag_context": [],
         "tool_calls_pending": [],
+        "tool_calls_queue": [],
         "hitl_approved": None,
         "action_results": [],
         "user_memory": {},
@@ -152,6 +153,10 @@ def base_agent_state():
         "guardrail_violations": [],
         "llm_provider": "",
         "execution_plan": [],
+        "data_collection_required": False,
+        "google_action_iterations": 0,
+        "sanitized_user_input": None,
+        "pii_map": {},
         "error": None,
     }
 

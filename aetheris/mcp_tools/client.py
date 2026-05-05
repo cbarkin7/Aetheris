@@ -194,36 +194,26 @@ async def get_mcp_tools(
     )
 
     # ---------------------------------------------------------------------------
-    # Allowlist de tools por servidor.
-    # None  → aceptar todas las tools del servidor (sin filtro).
-    # set() → aceptar solo los nombres incluidos en el conjunto.
+    # Blocklist de tools por servidor.
+    # Solo se excluyen los nombres listados; el resto se acepta sin filtro.
     #
-    # @piotr-agier/google-drive-mcp expone ~25 tools (Drive + Docs + Sheets +
-    # Slides + Calendar duplicado). Filtramos a las operaciones de ficheros
-    # y documentos relevantes para el TFM, excluyendo el Calendar duplicado
-    # (ya cubierto por @cocal/google-calendar-mcp con nombres más específicos).
+    # Motivo de exclusión en "drive":
+    #   @piotr-agier/google-drive-mcp expone también herramientas de Calendar
+    #   (listCalendars, getCalendarEvents, …) que duplican las de
+    #   @cocal/google-calendar-mcp con nombres menos específicos. Excluirlas
+    #   evita que el LLM use la versión inferior cuando tiene la de Calendar.
     # ---------------------------------------------------------------------------
-    _TOOL_ALLOWLIST: dict[str, set[str] | None] = {
-        "tavily":   None,   # todas (5 tools: search, extract, crawl, map, research)
-        "calendar": None,   # todas (13 tools de @cocal/google-calendar-mcp)
-        "gmail":    None,   # todas las tools del servidor Gmail MCP
-        "drive": {
-            # Gestión de ficheros
-            "search", "listFolder", "uploadFile", "downloadFile",
-            "createTextFile", "updateTextFile", "deleteItem",
-            "moveItem", "renameItem", "copyFile",
-            # Google Docs
-            "createGoogleDoc", "readGoogleDoc", "insertText",
-            "deleteRange", "applyTextStyle", "insertTable", "addComment",
-            # Google Sheets
-            "createGoogleSheet", "updateGoogleSheet",
-            "appendSpreadsheetRows", "formatGoogleSheetCells", "addDataValidation",
-            # Google Slides
-            "createGoogleSlides", "formatGoogleSlidesText",
-            "setGoogleSlidesBackground", "deleteGoogleSlide",
-            # EXCLUIDAS: listCalendars, getCalendarEvents, createCalendarEvent,
-            # updateCalendarEvent, deleteCalendarEvent — duplican @cocal/google-calendar-mcp
-        },
+    _TOOL_BLOCKLIST: dict[str, set[str]] = {
+        "tavily":   set(),  # sin exclusiones
+        "calendar": set(),  # sin exclusiones
+        "gmail":    set(),  # sin exclusiones
+        "drive":    set(),  # sin exclusiones — añadir nombres aquí para filtrar
+        # Ejemplo de tools a excluir en drive si se quieren evitar duplicados
+        # de @cocal/google-calendar-mcp:
+        # "drive": {
+        #     "listCalendars", "getCalendarEvents",
+        #     "createCalendarEvent", "updateCalendarEvent", "deleteCalendarEvent",
+        # },
     }
 
     # Cada servidor se conecta por separado para que un fallo no cancele los demás.
@@ -238,17 +228,16 @@ async def get_mcp_tools(
             client = MultiServerMCPClient({name: config})
             tools = await client.get_tools()
 
-            # Aplicar allowlist si está definida para este servidor
-            allowlist = _TOOL_ALLOWLIST.get(name)
-            if allowlist is not None:
-                filtered = [t for t in tools if t.name in allowlist]
-                dropped = [t.name for t in tools if t.name not in allowlist]
+            # Aplicar blocklist: excluir solo las tools no deseadas
+            blocked = _TOOL_BLOCKLIST.get(name, set())
+            if blocked:
+                dropped = [t.name for t in tools if t.name in blocked]
+                tools = [t for t in tools if t.name not in blocked]
                 if dropped:
-                    logger.debug(
-                        "[MCP] → get_mcp_tools | servidor='%s' | tools excluidas: %s",
+                    logger.info(
+                        "[MCP] → get_mcp_tools | servidor='%s' | tools excluidas (blocklist): %s",
                         name, dropped,
                     )
-                tools = filtered
 
             mcp_clients.append(client)
             all_tools.extend(tools)

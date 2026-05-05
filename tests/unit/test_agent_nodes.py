@@ -67,6 +67,52 @@ def test_input_guardrail_disabled(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_input_guardrail_pii_preserves_original_message(monkeypatch):
+    """Con PII detectada: el mensaje original NO se modifica en state.messages.
+    La versión saneada va a sanitized_user_input (solo para LLMs)."""
+    monkeypatch.setenv("GUARDRAILS_ENABLED", "true")
+    original_text = "Envía un email a usuario@ejemplo.com con el asunto Test"
+    s = {
+        "messages": [HumanMessage(content=original_text, id="msg-1")],
+        "thread_id": "t1", "user_id": "u1", "intent": "plain_llm", "rag_context": [],
+        "tool_calls_pending": [], "hitl_approved": None, "user_memory": {},
+        "guardrail_passed": None, "guardrail_violations": [], "llm_provider": "",
+        "execution_plan": [], "error": None,
+    }
+    from aetheris.agent.nodes import input_guardrail_node
+    result = input_guardrail_node(s)
+
+    assert result["guardrail_passed"] is True
+    # El resultado NO debe incluir "messages" (el mensaje original queda intacto en state)
+    assert "messages" not in result, (
+        "input_guardrail_node no debe modificar messages — "
+        "los datos reales deben persistir en el historial"
+    )
+    # La versión saneada va a sanitized_user_input para uso exclusivo del LLM
+    sanitized = result.get("sanitized_user_input")
+    if sanitized is not None:
+        assert "usuario@ejemplo.com" not in sanitized, (
+            "El email real no debe aparecer en sanitized_user_input"
+        )
+        assert "[EMAIL_REDACTADO]" in sanitized or "@" not in sanitized
+
+
+def test_input_guardrail_no_pii_clears_sanitized_input(monkeypatch):
+    """Sin PII: sanitized_user_input se establece a None para no usar datos obsoletos."""
+    monkeypatch.setenv("GUARDRAILS_ENABLED", "true")
+    s = {
+        "messages": [HumanMessage(content="¿Qué tiempo hace hoy?")],
+        "thread_id": "t1", "user_id": "u1", "intent": "plain_llm", "rag_context": [],
+        "tool_calls_pending": [], "hitl_approved": None, "user_memory": {},
+        "guardrail_passed": None, "guardrail_violations": [], "llm_provider": "",
+        "execution_plan": [], "error": None,
+    }
+    from aetheris.agent.nodes import input_guardrail_node
+    result = input_guardrail_node(s)
+    assert result["guardrail_passed"] is True
+    assert result.get("sanitized_user_input") is None
+
+
 # ---------------------------------------------------------------------------
 # load_memory_node
 # ---------------------------------------------------------------------------
@@ -129,11 +175,14 @@ def test_plan_dispatch_pops_next(state):
     assert result["intent"] == "web_search"
     assert result["execution_plan"] == ["plain_llm"]
 
-def test_plan_dispatch_empty_sets_plain_llm(state):
+def test_plan_dispatch_empty_does_not_override_intent(state):
+    """Cuando el plan está vacío, plan_dispatch_node NO sobreescribe el intent
+    (Fix 2: conservar el intent actual para que llm_node no pierda el contexto)."""
     state["execution_plan"] = []
+    state["intent"] = "rag"
     from aetheris.agent.nodes import plan_dispatch_node
     result = plan_dispatch_node(state)
-    assert result["intent"] == "plain_llm"
+    assert "intent" not in result   # intent no se sobreescribe
     assert result["execution_plan"] == []
 
 

@@ -30,7 +30,13 @@ class AgentState(TypedDict):
 
     # Llamadas a herramientas MCP pendientes de aprobación HITL
     # Cada elemento: {name, args, description}
+    # Siempre contiene UNA sola acción: la que se está mostrando al usuario ahora.
     tool_calls_pending: list[dict]
+
+    # Cola de acciones pendientes de procesar después de la actual.
+    # hitl_node toma una acción de aquí en cada iteración hasta vaciar la cola.
+    # Se rellena cuando google_planner_node devuelve múltiples tool_calls.
+    tool_calls_queue: list[dict]
 
     # None = aún no preguntado | True = aprobado | False = rechazado
     hitl_approved: bool | None
@@ -53,8 +59,23 @@ class AgentState(TypedDict):
     # para restaurar emails, teléfonos, etc. antes de invocar las tools de Google.
     pii_map: dict[str, str]
 
+    # Versión del último mensaje del usuario con PII redactada, para enviar al LLM.
+    # El mensaje ORIGINAL (con datos reales) se conserva en `messages` sin modificar,
+    # de modo que el historial de conversación persistido en BD muestra datos reales.
+    # None cuando el mensaje actual no contiene PII.
+    sanitized_user_input: str | None
+
     # Proveedor LLM activo (para trazabilidad del fallback)
     llm_provider: str
+
+    # True cuando hitl_node ha preguntado datos faltantes al usuario.
+    # llm_node hace pass-through (sin llamar al LLM) para no duplicar la pregunta.
+    data_collection_required: bool
+
+    # Contador de iteraciones del bucle hitl_node → google_action_node.
+    # Previene bucles infinitos: se resetea en manager_node y se incrementa
+    # en google_action_node. Límite: MAX_GOOGLE_ITERATIONS en edges.py.
+    google_action_iterations: int
 
     # Error irrecuperable, si ocurre
     error: str | None
