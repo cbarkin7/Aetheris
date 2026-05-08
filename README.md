@@ -16,7 +16,7 @@ Streamlit (puerto 8501) ──SSE──► FastAPI (puerto 8000) ──► Grafo
                          RAG (Chroma)    Herramientas MCP  Memoria
                                        (Tavily 5 tools /  (mem0 + SQLite + Chroma)
                                         Google Calendar
-                                        + Gmail HTTP
+                                        + Gmail Python stdio (gmail_mcp_server.py)
                                         + Google Drive)
 ```
 
@@ -30,8 +30,8 @@ Documentación completa de arquitectura: [`docs/architecture.md`](docs/architect
 |---|---|
 | RAG (documentos privados) | LangChain + Chroma, recuperación MMR, >85% tasa de acierto |
 | Búsqueda web — 5 herramientas | `tavily-mcp`: search, research, extract, crawl, map |
-| Google Workspace | Calendar (stdio), Gmail (HTTP+Bearer) y Drive (stdio) mediante MCP OAuth2 |
-| Human-in-the-Loop | LangGraph `interrupt_before` + `hitl_wait_node`, lecturas auto-ejecutadas sin modal |
+| Google Workspace | Calendar (stdio), Gmail (stdio, Python nativo) y Drive (stdio) mediante MCP OAuth2 |
+| Human-in-the-Loop | HITL uno a uno: aprobación/rechazo por acción; cola de acciones pendientes; rechazo continúa con la siguiente acción; lecturas auto-ejecutadas |
 | Guardrails de seguridad | Filtrado entrada/salida bilingüe (EN+ES), detección de inyección de prompts, redacción de PII |
 | Fallback LLM | OpenAI → AWS Bedrock (Anthropic Claude) automático |
 | Memoria a corto plazo | mem0.ai (cloud o local con Chroma) |
@@ -49,8 +49,7 @@ Documentación completa de arquitectura: [`docs/architecture.md`](docs/architect
 - Python 3.12+
 - Node.js 18+ (necesario para servidores MCP vía `npx`)
 - Claves API: OpenAI, LangSmith, Tavily
-- Google OAuth: `client_secret_aetheris.json` + `GOOGLE_REFRESH_TOKEN` (Calendar y Drive)
-- (Opcional) Servidor Gmail MCP HTTP externo en `GMAIL_MCP_URL` para las acciones de Gmail
+- Google OAuth: `client_secret_aetheris.json` + `GOOGLE_REFRESH_TOKEN` (Calendar, Gmail y Drive)
 - (Opcional) Credenciales AWS para fallback Bedrock
 - (Opcional) Clave API de mem0.ai para modo cloud
 
@@ -97,7 +96,7 @@ npx @modelcontextprotocol/server-gdrive auth
 
 Copia el `refresh_token` del fichero generado en `GOOGLE_REFRESH_TOKEN` de tu `.env`.
 
-> **Gmail** usa transporte HTTP+Bearer — no requiere `npx auth`. El servidor Gmail MCP HTTP debe estar corriendo en `GMAIL_MCP_URL` antes de arrancar AETHERIS.
+> **Gmail** usa el servidor Python nativo `aetheris/mcp_tools/gmail_mcp_server.py` con transporte stdio — se lanza automáticamente al arrancar AETHERIS, sin dependencia npm ni proceso HTTP externo. No requiere `npx auth` adicional: usa el mismo `GOOGLE_REFRESH_TOKEN` que Calendar y Drive.
 
 ### 5. Ejecutar el backend
 
@@ -142,8 +141,7 @@ python scripts/ingest_documents.py --dir ./docs/
 | `TAVILY_API_KEY` | No | Búsqueda web MCP Tavily (5 herramientas) |
 | `MEM0_API_KEY` | No | mem0.ai cloud (dejar vacío para modo local) |
 | `GOOGLE_CLIENT_SECRET_FILE` | No | Ruta a `client_secret_aetheris.json` |
-| `GOOGLE_REFRESH_TOKEN` | No | Refresh token OAuth2 de Google (Calendar + Drive) |
-| `GMAIL_MCP_URL` | No | URL del servidor Gmail MCP HTTP (por defecto: `http://localhost:30000/mcp`) |
+| `GOOGLE_REFRESH_TOKEN` | No | Refresh token OAuth2 de Google (Calendar, Gmail y Drive) |
 | `WHISPER_MODEL_SIZE` | No | Tamaño del modelo Whisper (`small` por defecto) |
 | `GUARDRAILS_ENABLED` | No | Activar guardrails de seguridad (`true`) |
 | `LLM_MODEL` | No | Nombre del modelo (por defecto: `gpt-4o-mini`) |
@@ -156,12 +154,14 @@ Consulta [`.env.example`](.env.example) para la lista completa.
 
 ```
 START → Guardrail entrada → [bloqueado → rechazo | OK → cargar memoria → manager]
-    intent → {RAG | web_search (Tavily) | google_action → hitl_node | LLM directo}
+    intent → {RAG | web_search (Tavily) | google_action → google_planner_node | LLM directo}
 ```
 
-**HITL (Human-in-the-Loop):**
-- **Acciones de lectura** (`list-calendars`, `list_files`, etc.) — auto-ejecutadas sin modal.
-- **Acciones destructivas** (`create-event`, `send-email`, `delete_file`, etc.) — el grafo pausa en `hitl_wait_node` con `interrupt_before`. El frontend muestra un modal de aprobación/rechazo; la reanudación se hace vía `POST /api/v1/chat/{thread_id}/resume`.
+**HITL uno a uno:**
+- `google_planner_node` planifica las acciones y aplica correcciones deterministas (búsqueda previa a borrado, fix de ordenación, etc.)
+- **Acciones de lectura** — auto-ejecutadas sin modal.
+- **Acciones destructivas** — el agente procesa una acción por turno. Si hay varias, el modal se muestra acción a acción. Si el usuario rechaza una, el flujo continúa con la siguiente.
+- La reanudación se hace vía `POST /api/v1/chat/{thread_id}/resume`.
 
 ```
     → generar respuesta → Guardrail salida → guardar memoria → END
@@ -186,13 +186,13 @@ automáticamente la herramienta Tavily más adecuada según el tipo de consulta:
 
 ## Google Workspace MCP
 
-| Servicio | Transporte | Paquete | Autenticación |
+| Servicio | Transporte | Paquete / Servidor | Autenticación |
 |---|---|---|---|
-| Calendar | stdio | `@cocal/google-calendar-mcp` | `GOOGLE_OAUTH_CREDENTIALS` + `.calendar-token.json` |
-| Gmail | HTTP+Bearer | servidor externo | `GMAIL_MCP_URL` + Bearer token OAuth2 dinámico |
-| Drive | stdio | `@modelcontextprotocol/server-gdrive` | `GOOGLE_OAUTH_CREDENTIALS` + `.drive-token.json` |
+| Calendar | stdio | `@cocal/google-calendar-mcp` (npx) | `GOOGLE_OAUTH_CREDENTIALS` + `.calendar-token.json` |
+| Gmail | stdio | `gmail_mcp_server.py` (Python nativo) | `GMAIL_TOKEN_PATH` + `GOOGLE_REFRESH_TOKEN` |
+| Drive | stdio | `@piotr-agier/google-drive-mcp` (npx) | `GOOGLE_DRIVE_OAUTH_CREDENTIALS` + `.drive-token.json` |
 
-Los ficheros de token en `data/google/` se generan automáticamente al arrancar AETHERIS a partir de `GOOGLE_REFRESH_TOKEN`. Solo es necesario ejecutar `npx ... auth` una vez para obtener el refresh token inicial.
+Los ficheros de token en `data/google/` se generan automáticamente al arrancar AETHERIS a partir de `GOOGLE_REFRESH_TOKEN`. Solo es necesario ejecutar `npx ... auth` una vez para obtener el refresh token inicial (Calendar y Drive). Gmail usa el mismo refresh token directamente desde `google-auth`.
 
 ---
 
@@ -215,6 +215,8 @@ Si OpenAI devuelve un error (timeout, cuota, fallo de API), el sistema redirige 
 | Corto plazo (conversacional) | mem0.ai | Por `user_id` + `session_id` | mem0 cloud o local |
 | Largo plazo (preferencias) | SQLite `user_memory` | Por `user_id` entre sesiones | Tabla clave-valor |
 | Largo plazo (hechos semánticos) | Chroma | Por `user_id`, búsqueda semántica | Colección `aetheris_long_term_facts` |
+
+> **PII:** Los mensajes originales (con datos reales) se persisten siempre en el checkpoint de LangGraph. La versión PII-redactada (`sanitized_user_input`) se usa exclusivamente para las llamadas al LLM y nunca se almacena en el historial.
 
 ---
 
@@ -265,6 +267,8 @@ aetheris/
 | POST | `/api/v1/chat` | Iniciar/continuar chat (stream SSE) |
 | POST | `/api/v1/chat/{id}/resume` | Reanudar tras aprobación HITL |
 | GET | `/api/v1/chat/{id}/history` | Obtener historial de conversación |
+| DELETE | `/api/v1/chat/{id}` | Eliminar conversación e historial |
+| GET | `/api/v1/chat/threads/{user_id}` | Listar conversaciones del usuario |
 | POST | `/api/v1/documents/upload` | Subir + ingestar documento |
 | GET | `/api/v1/documents` | Listar documentos indexados |
 | DELETE | `/api/v1/documents/{id}` | Eliminar documento |

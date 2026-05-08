@@ -1,26 +1,24 @@
 """
 Google Workspace MCP server configuration (Calendar, Gmail, Drive).
 
-Paquetes utilizados:
-  - @cocal/google-calendar-mcp              → Google Calendar (stdio)
-  - @gongrzhe/server-gmail-mcp             → Gmail (HTTP en localhost:30000)
-  - @piotr-agier/google-drive-mcp          → Google Drive (stdio)
+Paquetes y servidores utilizados:
+  - @cocal/google-calendar-mcp              → Google Calendar (stdio, npx)
+  - gmail_mcp_server.py                     → Gmail (stdio, Python nativo, google-auth)
+  - @piotr-agier/google-drive-mcp          → Google Drive (stdio, npx)
 
 Credenciales OAuth2:
   - GOOGLE_OAUTH_CREDENTIALS apunta a data/google/client_secret_aetheris.json,
     el fichero JSON descargado desde Google Cloud Console (tipo Desktop app).
     client_id y client_secret se leen directamente de ese fichero.
   - ensure_google_token_files() escribe .calendar-token.json y .gmail-token.json
-  - ensure_google_drive_token_files() escribe .drive-token.json (formato raw OAuth2)
-  - start_gmail_mcp_server() arranca @gongrzhe/server-gmail-mcp como proceso HTTP local
+  - ensure_google_drive_token_files() escribe .drive-token.json (formato authorized_user)
+  - gmail_server_config() lanza gmail_mcp_server.py vía stdio con GMAIL_TOKEN_PATH/
+    GMAIL_CLIENT_SECRET_PATH; el servidor refresca el token con google-auth internamente.
 """
-import asyncio
 import json
 import logging
 import os
-import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
 
 from aetheris.config import get_settings
 
@@ -191,12 +189,18 @@ def ensure_google_token_files() -> bool:
                  list(_CALENDAR_ACCOUNTS))
 
     # ── Gmail ─────────────────────────────────────────────────────────────────
-    # Misma política que Calendar: pre-inyectar access_token fresco si es necesario.
-    # Reutilizar el ya obtenido para Calendar (misma credencial, mismo token).
+    # Pre-inyectar access_token fresco en .gmail-token.json para que
+    # gmail_mcp_server.py no tenga que hacer el primer refresco en frío.
+    # Reutiliza el token ya obtenido para Calendar (misma credencial OAuth2).
+    # Los scopes son los requeridos por la Gmail REST API (modify + readonly + send).
     gmail_token: dict = {
         "access_token": "",
         "refresh_token": settings.google_refresh_token,
-        "scope": "https://mail.google.com/",
+        "scope": (
+            "https://www.googleapis.com/auth/gmail.modify "
+            "https://www.googleapis.com/auth/gmail.readonly "
+            "https://www.googleapis.com/auth/gmail.send"
+        ),
         "token_type": "Bearer",
         "expiry_date": 1,
     }
@@ -403,23 +407,65 @@ def calendar_server_config() -> dict:
     }
 
 
+def _ensure_gmail_token_has_client_credentials() -> None:
+    """
+    Asegura que .gmail-token.json incluye client_id y client_secret.
+
+    google-auth necesita client_id + client_secret para refrescar el
+    access_token automáticamente. Si el fichero solo tiene access_token y
+    refresh_token (formato minimal), los añade desde client_secret_aetheris.json.
+    """
+    if not _GMAIL_TOKEN_FILE.exists():
+        return
+    try:
+        token_data = json.loads(_GMAIL_TOKEN_FILE.read_text(encoding="utf-8"))
+        if token_data.get("client_id") and token_data.get("client_secret"):
+            return  # Ya están presentes
+        client_id, client_secret = _read_client_credentials()
+        if not (client_id and client_secret):
+            return
+        token_data["client_id"] = client_id
+        token_data["client_secret"] = client_secret
+        _GMAIL_TOKEN_FILE.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
+        logger.debug(
+            "[MCP] → _ensure_gmail_token_has_client_credentials | "
+            "client_id/secret añadidos a .gmail-token.json"
+        )
+    except Exception as exc:
+        logger.warning(
+            "[MCP] → _ensure_gmail_token_has_client_credentials | error: %s", exc
+        )
+
+
 def gmail_server_config() -> dict:
     """
-    Configuración del servidor MCP de Gmail (HTTP + Bearer token).
+    Configuración del servidor MCP de Gmail — Python nativo, transporte stdio.
 
-    Requiere un servidor Gmail MCP HTTP corriendo en GMAIL_MCP_URL
-    (p.ej. Composio o servidor auto-hospedado).
+    Servidor MCP Python propio (aetheris/mcp_tools/gmail_mcp_server.py) que
+    usa google-auth y la Gmail REST API directamente vía transporte stdio.
 
-    El access_token tiene validez ~1 hora. Limitación conocida del TFM.
+    Ventajas sobre el anterior servidor npm HTTP:
+    - Sin dependencia de npm ni proceso HTTP externo
+    - Refresh de token OAuth2 automático y robusto (google-auth nativo)
+    - Mismo transporte stdio que Calendar y Drive → arquitectura uniforme
+    - Producción-ready: no hay paths hardcodeados en ~/.gmail-mcp/
     """
-    from aetheris.mcp_tools.google_auth import get_google_access_token
-    settings = get_settings()
-    access_token = get_google_access_token()
+    import sys
+
+    _ensure_gmail_token_has_client_credentials()
+    server_script = str(Path(__file__).parent / "gmail_mcp_server.py")
+    secret_file = str(_resolve_secret_file())
+    token_path = str(_GMAIL_TOKEN_FILE.resolve())
 
     return {
-        "transport": "http",
-        "url": settings.gmail_mcp_url,
-        "headers": {"Authorization": f"Bearer {access_token}"},
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": [server_script],
+        "env": {
+            **os.environ.copy(),
+            "GMAIL_TOKEN_PATH": token_path,
+            "GMAIL_CLIENT_SECRET_PATH": secret_file,
+        },
     }
 
 
@@ -459,124 +505,7 @@ def drive_server_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Gmail MCP HTTP server — gestión del proceso local
-# ---------------------------------------------------------------------------
-
-async def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> bool:
-    """
-    Espera (async) hasta que el puerto TCP esté aceptando conexiones.
-    Devuelve True si el puerto abrió antes del timeout, False si no.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=1.0
-            )
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return True
-        except Exception:
-            await asyncio.sleep(0.5)
-    return False
-
-
-async def start_gmail_mcp_server() -> "subprocess.Popen | None":
-    """
-    Arranca @gongrzhe/server-gmail-mcp como proceso HTTP local y espera a que
-    el puerto esté disponible antes de devolver el control.
-
-    Solo se arranca si:
-    - GMAIL_MCP_URL apunta a localhost / 127.0.0.1 (servidor externo → no tocar)
-    - GOOGLE_REFRESH_TOKEN está configurado
-
-    El proceso devuelto debe guardarse en app.state.gmail_process y terminarse
-    en el shutdown del lifespan de FastAPI.
-
-    Returns: subprocess.Popen activo, o None si no aplica o falla el arranque.
-    """
-    settings = get_settings()
-
-    # Solo autoarrancar si la URL apunta a localhost
-    parsed = urlparse(settings.gmail_mcp_url)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 30000
-    if host not in ("localhost", "127.0.0.1"):
-        logger.info(
-            "[MCP] → start_gmail_mcp_server | GMAIL_MCP_URL es externo (%s) — no autoarrancando",
-            settings.gmail_mcp_url,
-        )
-        return None
-
-    if not settings.google_refresh_token:
-        logger.warning(
-            "[MCP] → start_gmail_mcp_server | GOOGLE_REFRESH_TOKEN no configurado — omitiendo"
-        )
-        return None
-
-    secret_file = str(_resolve_secret_file())
-    token_path = str(_GMAIL_TOKEN_FILE)
-
-    # El servidor Gmail MCP necesita las mismas credenciales que Calendar
-    gmail_env = {
-        **os.environ.copy(),
-        "GOOGLE_OAUTH_CREDENTIALS": secret_file,
-        "GOOGLE_GMAIL_MCP_TOKEN_PATH": token_path,
-    }
-
-    if os.name == "nt":
-        cmd = ["cmd", "/c", "npx", "-y", "@gongrzhe/server-gmail-mcp"]
-    else:
-        cmd = ["npx", "-y", "@gongrzhe/server-gmail-mcp"]
-
-    try:
-        logger.info(
-            "[MCP] → start_gmail_mcp_server | arrancando servidor Gmail MCP HTTP | "
-            "cmd=%s token=%s",
-            cmd, token_path,
-        )
-        process = subprocess.Popen(
-            cmd,
-            env=gmail_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-
-        logger.info(
-            "[MCP] → start_gmail_mcp_server | proceso arrancado pid=%d | "
-            "esperando puerto %s:%d (timeout=30s)",
-            process.pid, host, port,
-        )
-        ready = await _wait_for_port(host, port, timeout=30.0)
-
-        if ready:
-            logger.info(
-                "[MCP] → start_gmail_mcp_server | servidor Gmail MCP listo | "
-                "pid=%d url=%s",
-                process.pid, settings.gmail_mcp_url,
-            )
-        else:
-            logger.warning(
-                "[MCP] → start_gmail_mcp_server | timeout esperando puerto %d — "
-                "Gmail MCP podría no estar listo",
-                port,
-            )
-
-        return process
-
-    except Exception as exc:
-        logger.error(
-            "[MCP] → start_gmail_mcp_server | error arrancando servidor: %s", exc
-        )
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Alias de compatibilidad con versiones anteriores
+# Inicialización de credenciales (punto de entrada desde client.py)
 # ---------------------------------------------------------------------------
 
 def ensure_google_credentials_files() -> bool:
@@ -584,8 +513,3 @@ def ensure_google_credentials_files() -> bool:
     calendar_ok = ensure_google_token_files()
     drive_ok = ensure_google_drive_token_files()
     return calendar_ok and drive_ok
-
-
-def get_google_server_config() -> dict:
-    """Alias de compatibilidad → calendar_server_config()."""
-    return calendar_server_config()

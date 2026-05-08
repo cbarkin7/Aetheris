@@ -106,7 +106,8 @@ class TestInputGuardPII:
         assert result.passed is True
         assert "usuario@ejemplo.com" not in result.sanitized_text
         assert "[EMAIL_REDACTADO]" in result.sanitized_text
-        assert result.redactions.get("email", 0) >= 1
+        # redactions usa {placeholder: valor_original}
+        assert any("EMAIL" in k for k in result.redactions)
 
     def test_redacts_dni_nie_espanol(self, input_guard):
         result = input_guard.check("Mi DNI es 12345678Z, aquí te lo doy.")

@@ -16,8 +16,8 @@ Tests rápidos y aislados sin E/S externas. Todas las dependencias externas (LLM
 |---|---|
 | `test_config.py` | Carga de Settings, validación, comportamiento de caché |
 | `test_agent_state.py` | Estructura del TypedDict AgentState, reducer `add_messages`, todos los campos incluyendo `execution_plan` |
-| `test_agent_nodes.py` | Funciones de nodo individuales con `GenericFakeChatModel`; incluye guardrail nodes, `hitl_node` (pending/no-pending), `web_search_node` (selector LLM + fallback) |
-| `test_agent_edges.py` | Funciones de enrutamiento puras: `route_after_input_guardrail`, `route_by_intent`, `route_after_tool`, `route_after_hitl_node`, `route_after_hitl` |
+| `test_agent_nodes.py` | Funciones de nodo individuales con `GenericFakeChatModel`; incluye guardrail nodes, `hitl_node` (pending/no-pending), `web_search_node` (selector LLM + fallback); tests PII: `test_input_guardrail_pii_preserves_original_message`, `test_input_guardrail_no_pii_clears_sanitized_input` |
+| `test_agent_edges.py` | Funciones de enrutamiento puras: `route_after_input_guardrail`, `route_by_intent`, `route_after_tool`, `route_after_hitl_node`, `route_after_hitl`; incluye tests de `route_after_google` y `route_after_hitl` con cola no vacía y con rechazo |
 | `test_rag_ingest.py` | Carga de documentos, fragmentación, preservación de metadatos |
 | `test_rag_retriever.py` | Filtrado por umbral de puntuación, tipado de RetrievalResult |
 | `test_memory.py` | CRUD de memoria a largo plazo con SQLite en memoria |
@@ -41,7 +41,7 @@ Tests que usan Chroma real (en `/tmp`) y SQLite real, pero simulan las APIs exte
 | `test_agent_graph.py` | Compilación del grafo con `hitl_wait_node`, invocación de un turno, persistencia de checkpoint |
 | `test_api_chat.py` | Endpoints de salud, memoria y chat; evento `conversation_id` como primer SSE; filtrado SSE por nodo (`llm_node`); evento `guardrail_blocked`; flujo HITL completo (hitl_required → resume → action_result) |
 | `test_api_documents.py` | Endpoints de subida, listado y eliminación de documentos |
-| `test_mcp_tools.py` | Configuración de servidores MCP (`tavily-mcp`, `@cocal/google-calendar-mcp`, Gmail HTTP, `@modelcontextprotocol/server-gdrive`), degradación sin claves, `get_mcp_tools()` devuelve `(clients, tools)`, `google_available` basado en fichero |
+| `test_mcp_tools.py` | Configuración de servidores MCP (`tavily-mcp`, `@cocal/google-calendar-mcp`, Gmail Python stdio (`gmail_mcp_server.py`), `@piotr-agier/google-drive-mcp`), degradación sin claves, `get_mcp_tools()` devuelve `(clients, tools)`, `google_available` basado en fichero |
 
 **Ejecutar:**
 ```bash
@@ -95,7 +95,7 @@ pytest tests/e2e -v
 | `sample_txt_file` | Fichero de texto con contenido conocido sobre AETHERIS |
 | `sample_md_file` | Fichero Markdown con contenido estructurado conocido |
 | `api_client` | `FastAPI TestClient` con grafo y checkpointer simulados (`AsyncMock`) |
-| `base_agent_state` | `AgentState` mínimo válido con todos los campos: `guardrail_passed`, `guardrail_violations`, `llm_provider`, `execution_plan`, `tool_calls_pending` |
+| `base_agent_state` | `AgentState` mínimo válido con todos los campos: `guardrail_passed`, `guardrail_violations`, `llm_provider`, `execution_plan`, `tool_calls_pending`, `tool_calls_queue`, `data_collection_required`, `google_action_iterations`, `action_results`, `sanitized_user_input`, `pii_map` |
 
 ---
 
@@ -173,13 +173,25 @@ El test simula el LLM del selector con `GenericFakeChatModel` que devuelve el JS
 
 ---
 
+## Tests HITL Multi-Acción
+
+Los tests en `test_agent_edges.py` y `test_agent_nodes.py` validan el flujo HITL uno a uno:
+
+- `route_after_google` con `tool_calls_queue` no vacía → `hitl_node` (no `google_planner_node`)
+- `route_after_hitl` con rechazo + cola no vacía → `hitl_node`
+- `route_after_hitl` con rechazo + cola vacía → `llm_node`
+- `hitl_node` con rechazo inyecta `ToolMessage` sintético y avanza la cola
+
+---
+
 ## Notas
 
 - Los tests que requieren claves API reales (`OPENAI_API_KEY`, `TAVILY_API_KEY`) deben ejecutarse en un entorno CI con secretos configurados, o saltarse localmente.
 - El fixture `override_settings` limpia la caché LRU de `get_settings()` antes y después de cada test para garantizar el aislamiento.
-- Los tests de subprocess MCP simulan `asyncio.create_subprocess_exec` para evitar lanzar procesos Node.js reales.
+- Los tests de subprocess MCP simulan `asyncio.create_subprocess_exec` para evitar lanzar procesos Node.js reales (o el servidor Python de Gmail).
 - Los mocks de `get_llm()` deben devolver una tupla `(fake_llm, "test")` ya que la función tiene múltiples valores de retorno.
-- El campo `base_agent_state` incluye todos los campos del TypedDict: `guardrail_passed`, `guardrail_violations`, `llm_provider`, `execution_plan` y `tool_calls_pending`.
+- `base_agent_state` incluye todos los campos nuevos del TypedDict: `tool_calls_queue`, `data_collection_required`, `google_action_iterations`, `action_results`, `sanitized_user_input`, `pii_map`.
+- `input_guardrail_node` ya no modifica `messages`; guarda la versión PII-redactada en `sanitized_user_input`. Los tests verifican que el mensaje original permanece intacto en el estado.
 - El checkpointer en tests síncronos usa `SqliteSaver(sqlite3.connect(..., check_same_thread=False))` directamente; en tests de API se usa `AsyncMock`.
 - Usar siempre `GenericFakeChatModel(messages=iter([...]))` — `FakeChatModel(responses=[...])` fue eliminado en versiones recientes de `langchain-core`.
 - Los nodos `web_search_node` y `google_action_node` son `async def` y usan `await tool.ainvoke()`. En tests, mockear con `AsyncMock` para respetar el protocolo async.

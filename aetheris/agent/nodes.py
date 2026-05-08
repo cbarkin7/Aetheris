@@ -102,7 +102,7 @@ _HITL_DESTRUCTIVE_ACTIONS = frozenset({
     "update_event",
     "delete_event",
     "create_calendar_event",
-    # --- @gongrzhe/server-gmail-autoauth-mcp (nombres reales con guión) ---
+    # --- gmail_mcp_server.py Python nativo (guión y guión_bajo) ---
     "send-email",
     "reply-to-email",
     "create-draft",
@@ -149,6 +149,61 @@ _HITL_DESTRUCTIVE_ACTIONS = frozenset({
     "updateCalendarEvent",
     "deleteCalendarEvent",
 })
+
+# ---------------------------------------------------------------------------
+# Herramientas Drive MCP con nombre genérico (sin keywords de Google)
+# ---------------------------------------------------------------------------
+# @piotr-agier/google-drive-mcp expone herramientas como "search", "deleteItem",
+# "renameItem"… que NO contienen "google", "drive", "calendar" ni "email" en su
+# nombre. El filtro de google_tools en google_planner_node las excluiría si no
+# las listamos explícitamente aquí. Sin esto el LLM nunca las recibe y usa
+# listGoogleDocs/Sheets como sustituto → errores de "restricciones en la búsqueda".
+_DRIVE_GENERIC_TOOL_NAMES = frozenset({
+    # Operaciones de ficheros y carpetas
+    "search", "listFolder", "listFiles",
+    "deleteItem", "moveItem", "renameItem", "copyFile",
+    "createFolder", "uploadFile", "downloadFile",
+    "createTextFile", "updateTextFile",
+    # Google Docs — operaciones de contenido
+    "insertText", "deleteRange", "applyTextStyle",
+    "insertTable", "addComment", "replaceText",
+    # Google Sheets — operaciones de contenido
+    "appendSpreadsheetRows", "formatGoogleSheetCells", "addDataValidation",
+    # Google Slides — operaciones de contenido
+    "formatGoogleSlidesText", "setGoogleSlidesBackground", "getGoogleSlidesContent",
+})
+
+
+def _is_tool_error(content) -> bool:
+    """
+    Detecta si el contenido de un ToolMessage representa un error.
+
+    Compatible con todos los formatos que devuelven los servidores MCP:
+      - str  → Drive MCP, Calendar MCP  ("Error: ...", "Permission Error: ...")
+      - list → Gmail MCP  ([{'type': 'text', 'text': 'Permission Error: ...'}])
+      - dict → casos menos frecuentes
+    """
+    if isinstance(content, str):
+        lower = content.lower()
+        return (
+            lower.startswith("error:")
+            or "permission error" in lower
+            or "permissiondenied" in lower
+            or "your oauth2 token lacks" in lower
+            or "api error" in lower
+            or "unauthorized" in lower
+            or "insufficient" in lower
+            or "access denied" in lower
+        )
+    if isinstance(content, list):
+        return any(
+            _is_tool_error(item.get("text", "") if isinstance(item, dict) else str(item))
+            for item in content
+        )
+    if isinstance(content, dict):
+        return _is_tool_error(content.get("text", content.get("error", "")))
+    return False
+
 
 # Singletons de guardrails (inicialización perezosa)
 _input_guard: InputGuard | None = None
@@ -391,15 +446,6 @@ def manager_node(state: AgentState) -> dict:
     memory_str = json.dumps(routing_memory, ensure_ascii=False)
     prompt = MANAGER_PROMPT.format(user_memory=memory_str, messages=messages_text)
 
-    # FIXME: Eliminar en prod — variables inyectadas en MANAGER_PROMPT
-    logger.debug(
-        "[FIXME-PROMPT] manager_node | MANAGER_PROMPT vars\n"
-        "  routing_memory → %s\n"
-        "  messages       →\n%s",
-        memory_str[:400],
-        messages_text[:600],
-    )
-
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         raw = response.content.strip()
@@ -443,8 +489,18 @@ def manager_node(state: AgentState) -> dict:
         "createfolder", "createfile", "uploadfile",
         # Calendar
         "calendar", "evento", "cita", "reunión", "reunion",
-        # Gmail
+        # Gmail — palabras genéricas de email (también capturan "mensajes de spam",
+        # "correos recibidos", "bandeja de entrada", etc.)
         "gmail", "correo", "email", "bandeja", "borrador",
+        "mensaje", "mensajes",          # "mensajes importantes", "mensajes de spam"
+        "spam",                         # exclusivo de email
+        "no leídos", "sin leer",        # estado de email
+        "recibidos",                    # "mensajes/correos recibidos"
+        "enviados",                     # "correos enviados"
+        "inbox",                        # bandeja en inglés
+        "reenviar", "reenvía",          # forward
+        "responde al correo",           # reply
+        "he recibido",                  # "los emails que he recibido hoy"
     }
     if steps == ["plain_llm"]:
         last_human_msg = _last_human(state["messages"])
@@ -606,15 +662,6 @@ async def web_search_node(state: AgentState, mcp_tools: list | None = None) -> d
     selector_prompt = WEB_TOOL_SELECTOR_PROMPT.format(
         tool_descriptions=tool_descriptions,
         query=query,
-    )
-
-    # FIXME: Eliminar en prod — variables inyectadas en WEB_TOOL_SELECTOR_PROMPT
-    logger.debug(
-        "[FIXME-PROMPT] web_search_node | WEB_TOOL_SELECTOR_PROMPT vars\n"
-        "  query            → %.200s\n"
-        "  tool_descriptions→\n%s",
-        query,
-        tool_descriptions,
     )
 
     # Mapa de argumentos por defecto para cada tool Tavily
@@ -803,9 +850,19 @@ def _detect_relevant_domains(messages: list) -> set[str]:
     # Solo se activa cuando el mensaje del usuario no menciona ningún dominio.
     # Se miran los ToolMessages recientes para inferir el dominio activo.
     for m in reversed(messages[-8:]):
-        if not (isinstance(m, ToolMessage) and isinstance(m.content, str)):
+        if not isinstance(m, ToolMessage):
             continue
-        tool_text = m.content.lower()[:300]
+        # Extraer texto del contenido independientemente del formato
+        # (str para Drive/Calendar, list de dicts para Gmail)
+        if isinstance(m.content, str):
+            tool_text = m.content.lower()[:300]
+        elif isinstance(m.content, list):
+            tool_text = " ".join(
+                str(item.get("text", "") if isinstance(item, dict) else item).lower()
+                for item in m.content
+            )[:300]
+        else:
+            continue
 
         if any(kw in tool_text for kw in ("event", "calendar", "vcalendar")):
             domains.add("calendar")
@@ -879,33 +936,132 @@ _LIST_TOOLS_WITH_QUERY = frozenset({
     "listFolder", "search",
 })
 
+# Operadores de la Drive API que requieren rawQuery=True.
+# Sin rawQuery=True, el servidor Drive MCP envuelve cualquier query en:
+#   fullText contains '...' and trashed=false
+# Esto convierte name='X' en una búsqueda por CONTENIDO (no por nombre).
+_DRIVE_API_OPERATORS = ("name=", "name contains", "trashed=", "trashed =", "in parents")
+
+
+def _count_search_results(content) -> int:
+    """
+    Extrae el número de archivos de la respuesta de la herramienta `search`.
+
+    El servidor Drive MCP devuelve: "Found N files:\n..."
+    Devuelve -1 si el contenido no tiene el formato esperado.
+    """
+    import re as _re
+    if isinstance(content, list):
+        content = " ".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    m = _re.match(r"Found (\d+) files?:", str(content))
+    return int(m.group(1)) if m else -1
+
 
 def _fix_list_tools(tool_calls: list) -> list:
     """
-    La API de Google Drive no admite orderBy cuando la query contiene fullText.
-    Si el LLM genera una llamada a listGoogleDocs/Sheets/Slides/search con
-    un término fullText Y un parámetro orderBy, eliminar orderBy para evitar
-    el error "Sorting is not supported for queries with fullText terms".
+    Correcciones deterministas para herramientas de listado/búsqueda en Drive.
+
+    Regla 0 — rawQuery=True para operadores Drive API (LA MÁS CRÍTICA):
+      Por defecto, `search` envuelve la query en:
+        fullText contains '...' and trashed=false
+      Esto convierte name='X' en búsqueda por CONTENIDO, no por nombre.
+      Para filtros de nombre (name=, name contains) SIEMPRE añadir rawQuery=True
+      para que la query llegue directa a la API de Google Drive.
+      Sin esta corrección, los archivos NO se encuentran aunque existan.
+
+    Regla 1 — fullText + orderBy:
+      La API de Google Drive no admite orderBy cuando la query contiene fullText.
+      Eliminar orderBy para evitar "Sorting is not supported for queries with
+      fullText terms".
+      NOTA: "name contains" tiene "contains" pero NO es fullText — no aplica esta
+      regla cuando el único "contains" es parte de "name contains 'X'".
+
+    Regla 2 — mimeType-only → listFolder:
+      Queries del tipo `mimeType='...'` sin filtro de nombre son genéricas y
+      fallan con restricciones. Convertirlas a `listFolder()` (sin argumentos
+      = raíz de Drive), que es más fiable para peticiones de tipo "lista mis X".
+
+    Regla 3 — name + mimeType → simplificar a solo name:
+      La query `name='X' and mimeType='...'` funciona en la API de Drive pero
+      no siempre es compatible con la implementación del MCP. Eliminar la parte
+      mimeType y dejar solo `name='X'` para maximizar la compatibilidad.
     """
+    import re as _re
+
     fixed = []
     for tc in tool_calls:
-        if tc.get("name", "") not in _LIST_TOOLS_WITH_QUERY:
+        name = tc.get("name", "")
+        if name not in _LIST_TOOLS_WITH_QUERY:
             fixed.append(tc)
             continue
 
         args = dict(tc.get("args", {}) or {})
-        query = str(args.get("query", "")).lower()
-        has_fulltext = "fulltext" in query or "contains" in query
+        query_orig: str = args.get("query", "") or ""
+        query_lower = query_orig.lower()
 
+        # ── Regla 2: mimeType-only → listFolder ─────────────────────────────
+        # Detectar filtros de nombre en cualquier sintaxis válida de la API Drive:
+        #   name='X'          → exacto
+        #   name contains 'X' → parcial (el LLM lo usa para búsquedas "contains")
+        has_name_filter = "name=" in query_lower or "name contains" in query_lower
+        has_mimetype = "mimetype" in query_lower
+        if has_mimetype and not has_name_filter:
+            logger.info(
+                "[PLANNER] _fix_list_tools | '%s' mimeType-only → listFolder()",
+                name,
+            )
+            fixed.append({**tc, "name": "listFolder", "args": {}})
+            continue
+
+        # ── Regla 3: name + mimeType → eliminar mimeType ────────────────────
+        if has_name_filter and has_mimetype:
+            simplified = _re.sub(
+                r"\s+and\s+mimeType\s*=\s*'[^']*'", "", query_orig, flags=_re.IGNORECASE
+            ).strip()
+            simplified = _re.sub(
+                r"mimeType\s*=\s*'[^']*'\s+and\s+", "", simplified, flags=_re.IGNORECASE
+            ).strip()
+            if simplified != query_orig:
+                logger.info(
+                    "[PLANNER] _fix_list_tools | '%s' name+mimeType → solo name | "
+                    "antes='%s' después='%s'",
+                    name, query_orig, simplified,
+                )
+                args["query"] = simplified
+                query_orig = simplified
+                query_lower = simplified.lower()
+                # No `continue` — aplicar Regla 0 al query simplificado
+
+        # ── Regla 1: fullText + orderBy ──────────────────────────────────────
+        # Solo aplica a búsquedas de contenido puro (fullText), no a name contains.
+        has_fulltext = "fulltext" in query_lower or (
+            "contains" in query_lower and "name contains" not in query_lower
+        )
         if has_fulltext and "orderBy" in args:
             logger.info(
                 "[PLANNER] _fix_list_tools | '%s' | fullText + orderBy → eliminando orderBy",
-                tc["name"],
+                name,
             )
             args.pop("orderBy")
-            fixed.append({**tc, "args": args})
-        else:
-            fixed.append(tc)
+
+        # ── Regla 0: rawQuery=True para operadores Drive API ─────────────────
+        # CRÍTICO: sin rawQuery=True, el MCP envuelve name='X' en fullText contains
+        # y la búsqueda por nombre no encuentra nada aunque el archivo exista.
+        # rawQuery=True pasa la query directamente a la API de Google Drive,
+        # que añade automáticamente "and trashed=false".
+        if name == "search" and "rawQuery" not in args:
+            query_current = (args.get("query", "") or "").lower()
+            if any(op in query_current for op in _DRIVE_API_OPERATORS):
+                args["rawQuery"] = True
+                logger.info(
+                    "[PLANNER] _fix_list_tools | Regla 0 | search + rawQuery=True | query='%s'",
+                    args.get("query", ""),
+                )
+
+        fixed.append({**tc, "args": args})
 
     return fixed
 
@@ -926,42 +1082,50 @@ def _looks_like_drive_id(value: str) -> bool:
 
 def _fix_delete_tools(tool_calls: list, messages: list) -> list:
     """
-    Corrección determinista pre-HITL para operaciones de borrado en Drive.
+    Corrección determinista pre-HITL para operaciones destructivas en Drive que
+    requieren un Drive file ID real (≥ 25 chars alfanuméricos).
 
-    Regla invariante: SIEMPRE hay que buscar el archivo antes de borrarlo.
-    Si el LLM genera un borrado con un nombre de fichero en lugar de un Drive ID,
-    se convierte en una búsqueda primero. El planner volverá a llamarse con el
-    resultado de la búsqueda y generará el deleteItem con el ID real.
+    Regla invariante: SIEMPRE buscar el archivo antes de operar sobre él.
+    Si el LLM genera cualquiera de estas operaciones con un nombre de fichero
+    en lugar de un Drive ID, se convierte en una búsqueda primero. El planner
+    volverá a llamarse con el resultado de la búsqueda y generará la operación
+    con el ID real.
 
     Casos corregidos:
-    1. deleteItem(fileId=<nombre>) → search(query="name='<nombre>'")
-       Solo se deja pasar deleteItem si fileId ya es un Drive ID real (≥ 25 chars).
-    2. deleteGoogleSlide sin slideObjectId → mismo tratamiento:
-       · Con Drive ID en presentationId → deleteItem(fileId=...)  [ya es el ID real]
-       · Con nombre de fichero → search(query="name='<nombre>'")
+    1. deleteItem(fileId=<nombre>)     → search(query="name='<nombre>'")
+    2. renameItem(fileId=<nombre>, …)  → search(query="name='<nombre>'")
+    3. moveItem(fileId=<nombre>, …)    → search(query="name='<nombre>'")
+    4. copyFile(fileId=<nombre>, …)    → search(query="name='<nombre>'")
+    5. deleteGoogleSlide sin slideObjectId:
+       · Con Drive ID en presentationId → deleteItem(fileId=<id>)
+       · Con nombre de fichero          → search(query="name='<nombre>'")
     """
+    # Herramientas que requieren fileId real (se interceptan si reciben un nombre)
+    _FILE_ID_TOOLS = frozenset({"deleteItem", "renameItem", "moveItem", "copyFile"})
+
     fixed = []
     for tc in tool_calls:
         name = tc.get("name", "")
         args = tc.get("args", {}) or {}
 
-        # ── Caso 1: deleteItem con nombre de fichero en fileId ────────────────
-        if name == "deleteItem":
+        # ── Casos 1-4: operaciones con fileId que parece un nombre ───────────
+        if name in _FILE_ID_TOOLS:
             file_id = str(args.get("fileId", "")).strip()
             if file_id and not _looks_like_drive_id(file_id):
-                # fileId parece un nombre → buscar primero
                 logger.info(
-                    "[PLANNER] _fix_delete_tools | deleteItem con nombre '%s' → "
-                    "search para obtener fileId", file_id,
+                    "[PLANNER] _fix_delete_tools | %s con nombre '%s' → "
+                    "search para obtener fileId", name, file_id,
                 )
+                # rawQuery=True: name='X' debe llegar como operador Drive API,
+                # no como fullText contains. Sin rawQuery la búsqueda no encuentra nada.
                 fixed.append({
                     **tc,
                     "name": "search",
-                    "args": {"query": f"name='{file_id}'"},
+                    "args": {"query": f"name='{file_id}'", "rawQuery": True},
                 })
                 continue
 
-        # ── Caso 2: deleteGoogleSlide sin slideObjectId ───────────────────────
+        # ── Caso 5: deleteGoogleSlide sin slideObjectId ───────────────────────
         elif name == "deleteGoogleSlide":
             slide_obj_id = str(args.get("slideObjectId", "")).strip()
             presentation_id = str(args.get("presentationId", "")).strip()
@@ -983,7 +1147,7 @@ def _fix_delete_tools(tool_calls: list, messages: list) -> list:
                     fixed.append({
                         **tc,
                         "name": "search",
-                        "args": {"query": f"name='{presentation_id}'"},
+                        "args": {"query": f"name='{presentation_id}'", "rawQuery": True},
                     })
                 else:
                     fixed.append(tc)
@@ -1040,10 +1204,18 @@ def google_planner_node(state: AgentState, mcp_tools: list | None = None) -> dic
             )],
         }
 
-    # Filtrar únicamente herramientas Google
+    # Filtrar únicamente herramientas Google.
+    # Se incluyen:
+    #   a) Herramientas cuyo nombre contiene keywords de Google/Workspace.
+    #   b) Herramientas con nombre genérico de @piotr-agier/google-drive-mcp
+    #      (search, deleteItem, renameItem, moveItem, listFolder…) que no
+    #      contienen esos keywords pero son exclusivas del servidor Drive MCP.
     google_tools = [
         t for t in mcp_tools
-        if any(kw in t.name.lower() for kw in ("google", "calendar", "gmail", "drive", "event", "email"))
+        if any(kw in t.name.lower() for kw in (
+            "google", "calendar", "gmail", "drive", "event", "email", "draft",
+        ))
+        or t.name in _DRIVE_GENERIC_TOOL_NAMES
     ]
     if not google_tools:
         logger.warning("[PLANNER] → google_planner_node | sin herramientas Google activas")
@@ -1108,13 +1280,67 @@ def google_planner_node(state: AgentState, mcp_tools: list | None = None) -> dic
         m for m in _recent
         if isinstance(m, ToolMessage)
         and getattr(m, "name", "") in _TERMINAL_TOOL_NAMES
-        and not str(getattr(m, "content", "")).startswith("Error:")
+        and not _is_tool_error(getattr(m, "content", ""))
     ]
     _failed_recent = [
         m for m in _recent
         if isinstance(m, ToolMessage)
-        and str(getattr(m, "content", "")).startswith("Error:")
+        and _is_tool_error(getattr(m, "content", ""))
     ]
+
+    # ── PASO 0.D — Búsqueda ambigua: múltiples resultados para acción destructiva ──
+    # Si el último ToolMessage de `search` (en este turno) devolvió >1 archivos
+    # y la petición del usuario implica una operación destructiva, preguntar al
+    # usuario cuál archivo quiere usar ANTES de continuar.
+    #
+    # Solo se activa cuando hay un ToolMessage de search reciente (desde el último
+    # HumanMessage). Si el usuario ya respondió (nuevo HumanMessage), `_recent`
+    # NO contendrá la búsqueda antigua → no se activa.
+    _DESTRUCTIVE_USER_KEYWORDS = frozenset({
+        "elimina", "borra", "borrar", "eliminar", "delete", "remove",
+        "renombra", "renombrar", "rename",
+        "mueve", "mover", "move",
+        "copia", "copiar", "copy",
+    })
+    _user_text_for_paso0 = (
+        _last_human(messages_orig).content.lower()
+        if _last_human(messages_orig) and isinstance(_last_human(messages_orig).content, str)
+        else ""
+    )
+    _is_destructive_req = any(kw in _user_text_for_paso0 for kw in _DESTRUCTIVE_USER_KEYWORDS)
+
+    if _is_destructive_req and not _successful_terminals:
+        _last_search_tm = next(
+            (m for m in reversed(_recent)
+             if isinstance(m, ToolMessage) and getattr(m, "name", "") == "search"),
+            None,
+        )
+        if _last_search_tm:
+            _n_results = _count_search_results(getattr(_last_search_tm, "content", ""))
+            if _n_results > 1:
+                _search_text = (
+                    _last_search_tm.content
+                    if isinstance(_last_search_tm.content, str)
+                    else str(_last_search_tm.content)
+                )
+                _disambiguation_text = (
+                    f"He encontrado **{_n_results} archivos** con ese nombre. "
+                    "Por favor, dime cuál quieres usar:\n\n"
+                    f"{_search_text}\n\n"
+                    "Puedes indicarme el número de orden, el nombre completo "
+                    "o el ID del archivo (entre corchetes en la lista)."
+                )
+                logger.info(
+                    "[PLANNER] → google_planner_node | PASO 0.D | "
+                    "búsqueda ambigua | %d resultados → pedir especificación al usuario",
+                    _n_results,
+                )
+                return {
+                    "messages": [AIMessage(content=_disambiguation_text)],
+                    "tool_calls_pending": [],
+                    "data_collection_required": True,
+                    "hitl_approved": None,
+                }
 
     # ── PASO 0.A — Tarea completada con éxito ────────────────────────────────
     if _successful_terminals and not _failed_recent:
@@ -1357,58 +1583,25 @@ async def google_action_node(state: AgentState, mcp_tools: list | None = None) -
             logger.info("[GOOGLE] → google_action_node | ejecutando | tool='%s'", call["name"])
             result = await tool.ainvoke(exec_args)
             summary = str(result)[:300]
-            result_messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
-            action_results.append({"ok": True, "name": call["name"], "summary": summary})
-            logger.info("[GOOGLE] → google_action_node | tool='%s' → completado", call["name"])
+            # Algunos servidores MCP (ej. Gmail HTTP) devuelven errores como
+            # respuesta "exitosa" (sin excepción) con contenido de tipo lista/dict.
+            # Usamos _is_tool_error() para detectarlos y marcar ok=False correctamente.
+            if _is_tool_error(result):
+                logger.warning(
+                    "[GOOGLE] → google_action_node | tool='%s' → respuesta contiene error | %s",
+                    call["name"], summary[:120],
+                )
+                result_messages.append(ToolMessage(content=f"Error: {summary}", tool_call_id=tc_id))
+                action_results.append({"ok": False, "name": call["name"], "error": summary})
+            else:
+                result_messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
+                action_results.append({"ok": True, "name": call["name"], "summary": summary})
+                logger.info("[GOOGLE] → google_action_node | tool='%s' → completado", call["name"])
         except Exception as exc:
             error_msg = str(exc)
-            # Detectar fallo de auth en herramientas Gmail (token Bearer expirado ~1h).
-            # Si el error contiene "401", "auth", "token" o "unauthorized", intentar
-            # refrescar el token y reintentar UNA vez con un cliente Gmail nuevo.
-            _is_gmail = any(kw in call["name"].lower() for kw in ("gmail", "email", "mail"))
-            _is_auth_error = any(kw in error_msg.lower() for kw in (
-                "401", "unauthorized", "unauthenticated", "auth", "token", "invalid_grant",
-            ))
-            if _is_gmail and _is_auth_error:
-                logger.warning(
-                    "[GOOGLE] → google_action_node | tool='%s' | fallo de auth Gmail — "
-                    "refrescando token y reintentando",
-                    call["name"],
-                )
-                try:
-                    from aetheris.mcp_tools.google_auth import get_google_access_token
-                    from aetheris.config import get_settings
-                    from langchain_mcp_adapters.client import MultiServerMCPClient
-                    _settings = get_settings()
-                    # Invalidar cache forzando llamada directa
-                    import aetheris.mcp_tools.google_auth as _gauth
-                    _gauth._cached_until = 0  # fuerza refresco en la siguiente llamada
-                    fresh_token = get_google_access_token()
-                    _fresh_client = MultiServerMCPClient({
-                        "gmail": {
-                            "transport": "http",
-                            "url": _settings.gmail_mcp_url,
-                            "headers": {"Authorization": f"Bearer {fresh_token}"},
-                        }
-                    })
-                    _fresh_tools = await _fresh_client.get_tools()
-                    _fresh_tool = next((t for t in _fresh_tools if t.name == call["name"]), None)
-                    if _fresh_tool:
-                        result = await _fresh_tool.ainvoke(exec_args)
-                        summary = str(result)[:300]
-                        result_messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
-                        action_results.append({"ok": True, "name": call["name"], "summary": summary})
-                        logger.info(
-                            "[GOOGLE] → google_action_node | tool='%s' → completado tras refresco de token",
-                            call["name"],
-                        )
-                        continue  # pasar al siguiente tool_call
-                except Exception as retry_exc:
-                    logger.error(
-                        "[GOOGLE] → google_action_node | reintento Gmail fallido | %s", retry_exc
-                    )
-                    error_msg = f"Error de autenticación Gmail (reintento fallido): {retry_exc}"
-
+            # El servidor Gmail MCP Python (gmail_mcp_server.py) gestiona el
+            # refresco de tokens internamente mediante google-auth. No se
+            # necesita ningún retry de Bearer HTTP aquí.
             logger.error("[GOOGLE] → google_action_node | tool='%s' → fallido | %s", call["name"], error_msg)
             result_messages.append(ToolMessage(content=f"Error: {error_msg}", tool_call_id=tc_id))
             action_results.append({"ok": False, "name": call["name"], "error": error_msg})
@@ -1509,20 +1702,6 @@ def llm_node(state: AgentState) -> dict:
     if state.get("hitl_approved") is False and state.get("tool_calls_pending"):
         system_content += "\n\nEl usuario ha rechazado la acción de Google solicitada. Acéptalo con amabilidad."
         logger.info("[LLM] → llm_node | acción HITL rechazada por el usuario")
-
-    # FIXME: Eliminar en prod — variables inyectadas en SYSTEM_PROMPT / RAG_SYSTEM_PROMPT
-    logger.debug(
-        "[FIXME-PROMPT] llm_node | variables de prompt\n"
-        "  intent      → %s\n"
-        "  user_memory → %.300s\n"
-        "  rag_context → %d fragmentos | %s\n"
-        "  web_context → %s",
-        intent,
-        memory_str,
-        len(rag_context),
-        [(c.get("source", "?"), round(c.get("score", 0), 3)) for c in rag_context],
-        (web_context[:200] + "…") if web_context else "None",
-    )
 
     # Aplicar PII sanitation solo para el LLM — el historial original no se toca.
     # _sanitize_tool_calls también limpia AIMessages huérfanos del historial.

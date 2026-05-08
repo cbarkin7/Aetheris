@@ -48,12 +48,15 @@ Herramientas disponibles:
 Reglas de planificación (en orden estricto de prioridad):
 1. "google_action" — para CUALQUIER operación con Google Workspace, incluyendo:
                     · Calendar: crear, leer, listar, modificar o eliminar eventos
-                    · Gmail: leer, buscar, redactar o enviar emails
+                    · Gmail: leer, buscar, listar, resumir, redactar, enviar o gestionar emails/mensajes
                     · Drive: listar carpetas, buscar archivos, leer contenido de archivos,
                       subir, descargar, mover, renombrar, eliminar archivos o documentos
                     Palabras clave que SIEMPRE implican google_action:
                     "Drive", "carpeta", "archivo", "documento", "fichero", "hoja de cálculo",
-                    "Calendar", "evento", "cita", "reunión", "Gmail", "email", "correo".
+                    "Calendar", "evento", "cita", "reunión",
+                    "Gmail", "email", "correo", "mensaje", "mensajes", "spam", "bandeja",
+                    "bandeja de entrada", "inbox", "no leídos", "sin leer", "recibidos",
+                    "enviados", "asunto del correo", "reenviar", "responder correo".
                     IMPORTANTE — estos casos son SIEMPRE google_action, NUNCA rag ni plain_llm:
                     · "dime mis archivos", "qué carpetas tengo", "lee el archivo X"
                     · "mueve el documento / la carpeta / el archivo"
@@ -61,6 +64,8 @@ Reglas de planificación (en orden estricto de prioridad):
                     · "crea una carpeta en Drive", "crea un doc", "sube el archivo"
                     · "el último documento", "el documento que creamos", "ese archivo"
                     · cualquier frase con "mover", "copiar", "subir", "descargar" + archivo/carpeta
+                    · "mensajes de hoy", "mensajes importantes", "mensajes de spam",
+                      "he recibido", "emails recibidos", "correos de hoy", "bandeja de entrada"
 2. "rag"           — SOLO para documentos subidos al sistema AETHERIS (base de conocimiento
                     privada). NO usar para consultas sobre Google Drive, Gmail o Calendar.
                     Cuando tengas duda entre rag y google_action, elige google_action.
@@ -209,34 +214,59 @@ DRIVE:
     NUNCA uses createGoogleDoc, createGoogleSheet ni uploadFile para crear carpetas.
   · Crear Google Doc             → createGoogleDoc(title, content, folderId opcional)
   · Crear hoja Google Sheets     → createGoogleSheet(title, folderId opcional)
-  · Buscar archivo/carpeta       → herramienta search (NO listGoogleDocs ni listGoogleSheets)
-  · Buscar carpeta por nombre    → search con:
-    query="name='NombreCarpeta' and mimeType='application/vnd.google-apps.folder'"
-  · Listar contenido de carpeta  → listFolder (sin folderId = raíz de Drive)
+
+  · Listar contenido del Drive   → listFolder()  ← sin argumentos = raíz de Drive
+    NUNCA uses listGoogleDocs ni listGoogleSheets para listar ficheros generales.
+    listGoogleDocs/Sheets SOLO sirve para listar documentos del tipo específico.
+
+  · Buscar archivo/carpeta — SIEMPRE con rawQuery=true y sin mimeType:
+    - Nombre exacto:      search(query="name='NombreFichero'", rawQuery=true)
+    - Nombre contiene:    search(query="name contains 'texto'", rawQuery=true)
+      Usar "name contains" cuando el usuario dice "que contenga", "que tenga",
+      "que empiece por" o cuando el nombre puede ser parcial.
+    - La búsqueda es SIEMPRE recursiva en todo el Drive (raíz + subcarpetas).
+    - La búsqueda de nombre es CASE-INSENSITIVE (Google Drive ignora mayúsculas/
+      minúsculas). Usa el nombre tal como el usuario lo escriba.
+    REGLA CRÍTICA #1: SIEMPRE incluir rawQuery=true.
+      Sin rawQuery=true, la query se transforma en fullText contains '...'
+      y busca por CONTENIDO del archivo en lugar de por nombre → no encuentra nada.
+    Correcto:   search(query="name='PruebaCreacion'", rawQuery=true)
+    Correcto:   search(query="name contains 'Horas_TFM'", rawQuery=true)
+    Incorrecto: search(query="name='PruebaCreacion'")            ← falta rawQuery
+    REGLA CRÍTICA #2: NUNCA añadas mimeType al query de search.
+      El mimeType en el query causa errores en el servidor MCP.
+    Incorrecto: search(query="name='X' and mimeType='...'", rawQuery=true)
+    REGLA CRÍTICA #3: Si la búsqueda devuelve VARIOS archivos con el mismo nombre,
+      NO procedas con la acción destructiva — informa al usuario de los resultados
+      y pregúntale cuál quiere usar (por posición en la lista o por ID).
+
+  · Listar carpeta específica    → listFolder(folderId=<id>)
   · Si falta el nombre → pregunta antes de ejecutar
 
-  ▸ REGLA DE ORO — ELIMINAR cualquier archivo o carpeta en Drive:
-    SIEMPRE busca primero, luego borra. Flujo OBLIGATORIO en DOS pasos:
-    1. search(query="name='nombre_del_fichero'") — para obtener el fileId real.
-    2. Revisa el ToolMessage del search:
-       · Si encontró el archivo → deleteItem(fileId=<id_obtenido>)
-       · Si no encontró nada   → informa al usuario: "No encontré ningún archivo
-         llamado 'X' en tu Drive." NO generes deleteItem si el search no encontró nada.
-    · NUNCA llames a deleteItem con un nombre de fichero en fileId.
-      deleteItem SOLO acepta un Drive ID real (cadena alfanumérica larga).
-    · NUNCA uses deleteGoogleSlide ni ninguna otra herramienta específica de tipo
-      para borrar un fichero o carpeta de Drive.
-    · deleteGoogleSlide SOLO se usa para eliminar una diapositiva DENTRO de una
-      presentación que seguirá existiendo (el archivo no se borra).
+  ▸ REGLA DE ORO — CUALQUIER operación que requiera fileId en Drive:
+    SIEMPRE busca primero con search(query="name='nombre'"), luego opera.
+    Flujo OBLIGATORIO para: eliminar, renombrar, mover, copiar.
 
-  Flujo estándar MOVER archivo:
-    1. search para obtener fileId del archivo fuente.
-    2. search para obtener folderId de la carpeta destino (o createFolder si no existe).
-    3. moveItem(fileId, newParentFolderId).
-    4. STOP.
+    Flujo eliminar (2 pasos):
+    1. search(query="name='nombre_del_fichero'", rawQuery=true) → obtener fileId real.
+    2. · Un resultado  → deleteItem(fileId=<id_obtenido>)
+       · Varios resultados → informa al usuario y pide que especifique cuál.
+       · Sin resultados → informa: "No encontré ningún archivo llamado 'X'."
+    NUNCA llames a deleteItem/renameItem/moveItem con un nombre en fileId.
+    SOLO aceptan Drive IDs reales (cadena alfanumérica ≥ 25 caracteres).
+    NUNCA uses deleteGoogleSlide para borrar un fichero o carpeta de Drive.
+
+    Flujo renombrar (2 pasos):
+    1. search(query="name='nombre_actual'", rawQuery=true) → obtener fileId.
+    2. renameItem(fileId=<id>, newName='nombre_nuevo')
+
+    Flujo mover (3 pasos):
+    1. search(query="name='fichero_fuente'", rawQuery=true) → fileId fuente.
+    2. search(query="name='carpeta_destino'", rawQuery=true) → folderId destino.
+    3. moveItem(fileId=<id_fuente>, newParentFolderId=<id_destino>)
 
   Flujo estándar "busca la carpeta X, si no existe créala":
-    1. search: query="name='X' and mimeType='application/vnd.google-apps.folder'"
+    1. search(query="name='X'", rawQuery=true) — SIEMPRE con rawQuery=true
     2. Si vacío → createFolder(name='X') → guardar el folderId devuelto
     3. Usar ese folderId como parentFolderId/folderId en createGoogleDoc / uploadFile / etc.
 

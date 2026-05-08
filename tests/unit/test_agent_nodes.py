@@ -232,7 +232,209 @@ def test_llm_node_rejection_when_blocked(state):
 # web_search_node
 # ---------------------------------------------------------------------------
 
-def test_web_search_node_no_tools_fallback(state):
+@pytest.mark.asyncio
+async def test_web_search_node_no_tools_fallback(state):
     from aetheris.agent.nodes import web_search_node
-    result = web_search_node(state, mcp_tools=None)
+    result = await web_search_node(state, mcp_tools=None)
     assert result.get("intent") == "plain_llm"
+
+
+# ---------------------------------------------------------------------------
+# _is_tool_error
+# ---------------------------------------------------------------------------
+
+class TestIsToolError:
+    def _fn(self):
+        from aetheris.agent.nodes import _is_tool_error
+        return _is_tool_error
+
+    def test_string_error_prefix(self):
+        assert self._fn()("Error: something went wrong") is True
+
+    def test_string_permission_error(self):
+        assert self._fn()("Permission Error: OAuth2 token lacks scope") is True
+
+    def test_string_clean(self):
+        assert self._fn()("File created successfully") is False
+
+    def test_list_gmail_format_error(self):
+        # Formato real del Gmail MCP: lista de dicts con 'type'/'text'
+        content = [{"type": "text", "text": "Permission Error: Your OAuth2 token lacks required Gmail API permissions."}]
+        assert self._fn()(content) is True
+
+    def test_list_gmail_format_success(self):
+        content = [{"type": "text", "text": "Email sent successfully."}]
+        assert self._fn()(content) is False
+
+    def test_empty_string(self):
+        assert self._fn()("") is False
+
+    def test_unauthorized(self):
+        assert self._fn()("Unauthorized: invalid credentials") is True
+
+
+# ---------------------------------------------------------------------------
+# _fix_list_tools — mimeType simplification
+# ---------------------------------------------------------------------------
+
+class TestFixListTools:
+    def _fn(self):
+        from aetheris.agent.nodes import _fix_list_tools
+        return _fix_list_tools
+
+    def _tc(self, name, **args):
+        return {"name": name, "args": args}
+
+    def test_mimetype_only_search_becomes_listfolder(self):
+        tc = self._tc("search", query="mimeType='application/vnd.google-apps.folder'")
+        result = self._fn()([tc])
+        assert len(result) == 1
+        assert result[0]["name"] == "listFolder"
+        assert result[0]["args"] == {}
+
+    def test_name_and_mimetype_strips_mimetype(self):
+        tc = self._tc("search", query="name='PruebaCreacion' and mimeType='application/vnd.google-apps.folder'")
+        result = self._fn()([tc])
+        assert len(result) == 1
+        assert result[0]["name"] == "search"
+        assert result[0]["args"]["query"] == "name='PruebaCreacion'"
+        # Regla 0: rawQuery=True debe añadirse porque la query tiene name=
+        assert result[0]["args"].get("rawQuery") is True
+
+    def test_mimetype_before_name_strips_mimetype(self):
+        tc = self._tc("search", query="mimeType='application/vnd.google-apps.folder' and name='TFM'")
+        result = self._fn()([tc])
+        assert result[0]["name"] == "search"
+        assert "mimeType" not in result[0]["args"]["query"].lower()
+        assert "name='TFM'" in result[0]["args"]["query"]
+        assert result[0]["args"].get("rawQuery") is True
+
+    def test_name_only_query_gets_raw_query(self):
+        """Regla 0: name='X' necesita rawQuery=True para buscar por nombre, no por contenido."""
+        tc = self._tc("search", query="name='informe_final.pdf'")
+        result = self._fn()([tc])
+        assert result[0]["name"] == "search"
+        assert result[0]["args"]["query"] == "name='informe_final.pdf'"
+        assert result[0]["args"].get("rawQuery") is True
+
+    def test_name_contains_query_gets_raw_query(self):
+        """Regla 0: name contains 'X' también necesita rawQuery=True."""
+        tc = self._tc("search", query="name contains 'Horas_TFM'")
+        result = self._fn()([tc])
+        assert result[0]["name"] == "search"
+        assert result[0]["args"].get("rawQuery") is True
+
+    def test_raw_query_already_set_not_duplicated(self):
+        """Regla 0: no sobrescribir rawQuery si ya está presente."""
+        tc = self._tc("search", query="name='X'", rawQuery=False)
+        result = self._fn()([tc])
+        assert result[0]["args"].get("rawQuery") is False  # no sobreescrito
+
+    def test_fulltext_search_no_raw_query(self):
+        """Búsquedas de contenido puro (sin operadores Drive API) no deben tener rawQuery."""
+        tc = self._tc("search", query="informe presupuesto anual")
+        result = self._fn()([tc])
+        assert result[0]["name"] == "search"
+        assert "rawQuery" not in result[0]["args"]  # fulltext puro → sin rawQuery
+
+    def test_fulltext_orderby_removed(self):
+        tc = self._tc("listGoogleDocs", query="fullText contains 'presupuesto'", orderBy="modifiedTime")
+        result = self._fn()([tc])
+        assert "orderBy" not in result[0]["args"]
+
+    def test_name_contains_orderby_not_removed(self):
+        """name contains NO es fullText — orderBy debe conservarse."""
+        tc = self._tc("search", query="name contains 'TFM'", orderBy="modifiedTime")
+        result = self._fn()([tc])
+        assert "orderBy" in result[0]["args"]
+
+    def test_non_list_tool_unchanged(self):
+        tc = self._tc("deleteItem", fileId="abc123")
+        result = self._fn()([tc])
+        assert result[0]["name"] == "deleteItem"
+
+
+# ---------------------------------------------------------------------------
+# _count_search_results
+# ---------------------------------------------------------------------------
+
+class TestCountSearchResults:
+    def _fn(self):
+        from aetheris.agent.nodes import _count_search_results
+        return _count_search_results
+
+    def test_found_zero_files(self):
+        assert self._fn()("Found 0 files:\n") == 0
+
+    def test_found_one_file(self):
+        content = "Found 1 file:\nPropuesta_comercial (application/vnd.google-apps.document) [id: abc123]"
+        assert self._fn()(content) == 1
+
+    def test_found_multiple_files(self):
+        content = "Found 3 files:\nFile1 ...\nFile2 ...\nFile3 ..."
+        assert self._fn()(content) == 3
+
+    def test_list_format_gmail_mcp(self):
+        """Formato lista devuelto por algunos servidores MCP."""
+        content = [{"type": "text", "text": "Found 2 files:\nFile1\nFile2"}]
+        assert self._fn()(content) == 2
+
+    def test_unrecognized_format_returns_minus_one(self):
+        assert self._fn()("No files found in your drive") == -1
+
+    def test_error_response_returns_minus_one(self):
+        assert self._fn()("Error: permission denied") == -1
+
+
+# ---------------------------------------------------------------------------
+# _fix_delete_tools — rename / move / copy con nombre
+# ---------------------------------------------------------------------------
+
+class TestFixDeleteTools:
+    def _fn(self):
+        from aetheris.agent.nodes import _fix_delete_tools
+        return _fix_delete_tools
+
+    def _tc(self, name, **args):
+        return {"name": name, "args": args}
+
+    def test_rename_with_filename_becomes_search(self):
+        tc = self._tc("renameItem", fileId="PruebaCreacion", newName="ModificaCreacion")
+        result = self._fn()([tc], [])
+        assert result[0]["name"] == "search"
+        assert "PruebaCreacion" in result[0]["args"]["query"]
+        # rawQuery=True es obligatorio para búsquedas por nombre
+        assert result[0]["args"].get("rawQuery") is True
+
+    def test_move_with_filename_becomes_search(self):
+        tc = self._tc("moveItem", fileId="informe.pdf", newParentFolderId="some-folder-id-xyz")
+        result = self._fn()([tc], [])
+        assert result[0]["name"] == "search"
+        assert "informe.pdf" in result[0]["args"]["query"]
+        assert result[0]["args"].get("rawQuery") is True
+
+    def test_copy_with_filename_becomes_search(self):
+        tc = self._tc("copyFile", fileId="Gastos Mayo.xlsx", newName="Gastos Junio.xlsx")
+        result = self._fn()([tc], [])
+        assert result[0]["name"] == "search"
+        assert result[0]["args"].get("rawQuery") is True
+
+    def test_delete_with_real_id_passes_through(self):
+        real_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+        tc = self._tc("deleteItem", fileId=real_id)
+        result = self._fn()([tc], [])
+        assert result[0]["name"] == "deleteItem"
+        assert result[0]["args"]["fileId"] == real_id
+
+    def test_rename_with_real_id_passes_through(self):
+        real_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+        tc = self._tc("renameItem", fileId=real_id, newName="NuevoNombre")
+        result = self._fn()([tc], [])
+        assert result[0]["name"] == "renameItem"
+
+    def test_delete_google_slide_without_slide_id_and_name_becomes_search(self):
+        tc = self._tc("deleteGoogleSlide", presentationId="Mi Presentacion TFM")
+        result = self._fn()([tc], [])
+        assert result[0]["name"] == "search"
+        assert "Mi Presentacion TFM" in result[0]["args"]["query"]
+        assert result[0]["args"].get("rawQuery") is True

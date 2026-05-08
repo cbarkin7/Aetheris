@@ -33,26 +33,13 @@ def get_google_access_token() -> str:
     root = get_project_root()
     secret_file = root / "data" / "google" / "client_secret_aetheris.json"
 
-    # FIXME: Eliminar — traza diagnóstica Gmail token
-    logger.info("[AUTH][FIXME] → get_google_access_token | secret_file='%s' exists=%s",
-                secret_file, secret_file.exists())
-
     data = json.loads(secret_file.read_text(encoding="utf-8"))
     client_data = data.get("installed") or data.get("web")
 
-    # CORRECCIÓN: usar settings.google_refresh_token (pydantic lee .env)
-    # os.getenv("GOOGLE_REFRESH_TOKEN") devuelve None si la variable no está
-    # en el entorno del OS, aunque esté definida en el fichero .env.
+    # Usar settings.google_refresh_token (pydantic lee .env).
+    # os.getenv("GOOGLE_REFRESH_TOKEN") puede devolver None si la variable
+    # no está exportada al entorno del OS, aunque esté definida en .env.
     refresh_token = settings.google_refresh_token
-
-    # FIXME: Eliminar — traza diagnóstica Gmail token
-    logger.info(
-        "[AUTH][FIXME] → get_google_access_token | "
-        "client_id='%s' client_secret_set=%s refresh_token_prefix='%s'",
-        client_data.get("client_id", "?"),
-        bool(client_data.get("client_secret")),
-        refresh_token[:20] + "..." if refresh_token else "VACÍO",
-    )
 
     payload = {
         "client_id": client_data["client_id"],
@@ -61,27 +48,11 @@ def get_google_access_token() -> str:
         "grant_type": "refresh_token",
     }
 
-    # FIXME: Eliminar — traza diagnóstica Gmail token
-    logger.info(
-        "[AUTH][FIXME] → get_google_access_token | POST token endpoint | "
-        "grant_type=%s refresh_token_set=%s",
-        payload["grant_type"],
-        bool(payload["refresh_token"]),
-    )
-
     response = requests.post(
         "https://oauth2.googleapis.com/token",
         data=payload,
         timeout=20,
     )
-
-    # FIXME: Eliminar — traza diagnóstica Gmail token
-    logger.info(
-        "[AUTH][FIXME] → get_google_access_token | respuesta | status=%s body=%s",
-        response.status_code,
-        response.text[:300],
-    )
-
     response.raise_for_status()
     resp_payload = response.json()
 

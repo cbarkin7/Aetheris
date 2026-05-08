@@ -54,14 +54,58 @@ Inicia o continúa una conversación. Devuelve un stream SSE (Server-Sent Events
   "actions": [
     {
       "id": "call_abc123",
-      "name": "create-event",
-      "args": {
-        "summary": "Reunión de equipo",
-        "start": {"dateTime": "2026-04-22T10:00:00"},
-        "end":   {"dateTime": "2026-04-22T11:00:00"}
-      },
-      "description": "Crear evento 'Reunión de equipo' el 22 de abril de 10:00 a 11:00."
+      "name": "deleteItem",
+      "args": {"fileId": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"},
+      "description": "Eliminar archivo 'informe_q4.pdf' de Drive.",
+      "requires_approval": true
     }
+  ]
+}
+```
+
+> **Nota:** el campo `actions` contiene siempre **una sola acción** (la acción actual pendiente de aprobación). Si el plan original incluía varias acciones, las restantes se mantienen en la cola interna `tool_calls_queue` y se presentan de una en una tras cada respuesta HITL.
+
+---
+
+### `DELETE /api/v1/chat/{thread_id}`
+
+Elimina una conversación y todos sus datos persistidos.
+
+**Parámetros de ruta:**
+- `thread_id` — ID del hilo a eliminar
+
+**Qué elimina:**
+- Registro en `memory.db` (tabla `conversations`)
+- Todos los checkpoints en `checkpoints.db` (tablas `checkpoints`, `checkpoint_writes`, `checkpoint_blobs`)
+
+**Respuesta (200 OK):**
+```json
+{"thread_id": "uuid", "memory_deleted": true, "checkpoints_deleted": true}
+```
+
+> Tras la eliminación, el `thread_id` queda inválido. Cualquier solicitud posterior que lo referencie devolverá `404 Not Found`.
+
+---
+
+### `GET /api/v1/chat/threads/{user_id}`
+
+Devuelve las conversaciones recientes del usuario para mostrar en el historial lateral.
+
+**Parámetros de ruta:**
+- `user_id` — ID del usuario
+
+**Query params:**
+
+| Parámetro | Tipo | Obligatorio | Descripción |
+|---|---|---|---|
+| `limit` | `int` | No | Número máximo de conversaciones a devolver (por defecto: `30`) |
+
+**Respuesta (200 OK):**
+```json
+{
+  "user_id": "Admin-Aetheris",
+  "conversations": [
+    {"thread_id": "uuid", "title": "Elimina el archivo...", "created_at": "...", "updated_at": "..."}
   ]
 }
 ```
@@ -324,6 +368,8 @@ Diagnóstico del estado de credenciales Google y herramientas MCP Google cargada
 | `POST` | `/api/v1/chat` | Iniciar/continuar chat (stream SSE) |
 | `POST` | `/api/v1/chat/{thread_id}/resume` | Reanudar tras aprobación HITL |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Historial de conversación |
+| `DELETE` | `/api/v1/chat/{thread_id}` | Eliminar conversación e historial |
+| `GET` | `/api/v1/chat/threads/{user_id}` | Listar conversaciones del usuario |
 | `POST` | `/api/v1/documents/upload` | Subir e ingestar documento |
 | `GET` | `/api/v1/documents` | Listar documentos indexados |
 | `DELETE` | `/api/v1/documents/{document_id}` | Eliminar documento |

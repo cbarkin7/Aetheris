@@ -6,7 +6,7 @@ Servidores disponibles:
   - tavily    → búsqueda web en tiempo real (@modelcontextprotocol/server-tavily)
   - calendar  → Google Calendar (@cocal/google-calendar-mcp)             [stdio, cmd /c npx]
   - drive     → Google Drive (@piotr-agier/google-drive-mcp)              [stdio, cmd /c npx]
-  - gmail     → Gmail HTTP + Bearer (servidor externo en GMAIL_MCP_URL)   [http]
+  - gmail     → Gmail Python MCP nativo (gmail_mcp_server.py)             [stdio]
 
 IMPORTANTE — ciclo de vida de los clientes:
   get_mcp_tools() devuelve (mcp_clients, mcp_tools).
@@ -49,13 +49,13 @@ def _google_server_configs(settings) -> dict[str, dict]:
     Construye los configs de los tres servidores MCP de Google usando:
     - get_google_env() de mcp_client.py → rutas absolutas, mismo env que los tests funcionales
     - cmd /c npx en Windows para Calendar y Drive (npx es .cmd en Windows)
-    - HTTP + Bearer para Gmail
+    - Servidor Python nativo (stdio) para Gmail — gmail_mcp_server.py
 
     Cada servidor se devuelve como entrada separada para permitir
     que get_mcp_tools() los conecte de forma independiente (fault isolation).
     """
     from aetheris.mcp_tools.mcp_client import get_google_env
-    from aetheris.mcp_tools.google_auth import get_google_access_token
+    from aetheris.mcp_tools.google_tools import gmail_server_config
 
     google_env = get_google_env()
 
@@ -84,16 +84,13 @@ def _google_server_configs(settings) -> dict[str, dict]:
         "env": google_env,
     }
 
-    # Gmail (HTTP + Bearer — no subprocess)
+    # Gmail — servidor MCP Python nativo (stdio), reemplaza el servidor npm HTTP.
+    # gmail_server_config() prepara el token con client_id/secret y devuelve
+    # el config para lanzar gmail_mcp_server.py como subproceso.
     try:
-        access_token = get_google_access_token()
-        configs["gmail"] = {
-            "transport": "http",
-            "url": settings.gmail_mcp_url,
-            "headers": {"Authorization": f"Bearer {access_token}"},
-        }
+        configs["gmail"] = gmail_server_config()
     except Exception as exc:
-        logger.warning("[MCP] → _google_server_configs | Gmail omitido (token fallido): %s", exc)
+        logger.warning("[MCP] → _google_server_configs | Gmail omitido: %s", exc)
 
     return configs
 

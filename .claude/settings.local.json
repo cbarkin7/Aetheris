@@ -44,7 +44,14 @@
       "Bash(python _test_full_flow.py)",
       "Bash(python -m pytest tests/ --co -q)",
       "Bash(pip show:*)",
-      "Bash(python -c \"from aetheris.logging_config import setup_logging; from aetheris.agent.nodes import input_guardrail_node, manager_node, llm_node; from aetheris.api.routers.chat import router; from aetheris.rag.ingest import ingest_file; from aetheris.mcp.client import get_mcp_tools; print\\('OK — todos los módulos importan correctamente'\\)\")"
+      "Bash(python -c \"from aetheris.logging_config import setup_logging; from aetheris.agent.nodes import input_guardrail_node, manager_node, llm_node; from aetheris.api.routers.chat import router; from aetheris.rag.ingest import ingest_file; from aetheris.mcp.client import get_mcp_tools; print\\('OK — todos los módulos importan correctamente'\\)\")",
+      "Bash(.venv\\\\Scripts\\\\pytest tests/unit -v --tb=short)",
+      "Bash(.venv/Scripts/pytest tests/unit -v --tb=short)",
+      "Bash(venv/Scripts/pytest.exe tests/unit -v --tb=short)",
+      "Bash(venv/Scripts/pytest.exe tests/unit/test_agent_nodes.py -v --tb=short)",
+      "Bash(venv/Scripts/python.exe scripts/_check_drive_scope.py)",
+      "Bash(venv/Scripts/pytest.exe tests/unit -q --tb=short)",
+      "mcp__Claude_in_Chrome__tabs_context_mcp"
     ]
   }
 }
