@@ -1,0 +1,23 @@
+# =============================================================================
+# AETHERIS — Streamlit configuration
+# Puerto 7860: unico puerto publico expuesto en Hugging Face Spaces Docker
+# =============================================================================
+
+[server]
+port = 7860
+address = "0.0.0.0"
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+maxUploadSize = 50          # MB — limite para subida de documentos
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#6366f1"    # Indigo — color corporativo AETHERIS
+backgroundColor = "#0f0f1a"
+secondaryBackgroundColor = "#1a1a2e"
+textColor = "#e2e8f0"
+font = "sans serif"

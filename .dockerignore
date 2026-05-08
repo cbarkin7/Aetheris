@@ -1,0 +1,65 @@
+# =============================================================================
+# AETHERIS — .dockerignore
+# Excluye ficheros innecesarios del contexto de build Docker
+# =============================================================================
+
+# Entornos virtuales Python
+venv/
+.venv/
+env/
+.env/
+
+# Caché Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Datos persistidos localmente (se crean en tiempo de ejecucion)
+data/chroma_db/
+data/sqlite/
+data/uploads/
+
+# Credenciales y secretos (se inyectan via env vars en HF Spaces)
+.env
+data/google/.calendar-token.json
+data/google/.gmail-token.json
+data/google/.drive-token.json
+data/google/client_secret_aetheris.json
+
+# Control de versiones
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing y cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Documentacion de desarrollo
+docs/
+
+# Logs
+*.log
+logs/
+
+# Jupyter Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

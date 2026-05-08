@@ -1,3 +1,15 @@
+---
+title: AETHERIS
+emoji: 🧠
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+short_description: Agente Cognitivo Autonomo - RAG + Google Workspace + HITL
+---
+
 # AETHERIS
 
 **Agente Cognitivo Autónomo** — Trabajo Fin de Máster (TFM, Máster en Soluciones IAG)
@@ -111,6 +123,73 @@ streamlit run aetheris/ui/app.py --server.port 8501
 ```
 
 Abre [http://localhost:8501](http://localhost:8501) en tu navegador.
+
+---
+
+## Despliegue en Hugging Face Spaces (Docker)
+
+AETHERIS incluye configuración lista para desplegar en [Hugging Face Spaces](https://huggingface.co/spaces) con el runtime Docker.
+
+### Arquitectura de contenedor
+
+```
+HF Spaces (puerto publico 7860)
+        │
+        ▼
+  [supervisord]
+    ├── Streamlit  :7860  (publico)
+    └── FastAPI    :8000  (interno — Streamlit lo llama via localhost)
+```
+
+### Pasos de despliegue
+
+1. **Crear un Space** en [huggingface.co/new-space](https://huggingface.co/new-space):
+   - SDK: **Docker**
+   - Hardware: CPU Basic (gratuito) o superior
+
+2. **Subir el repositorio** (o conectar tu repo de GitHub):
+   ```bash
+   git remote add hf https://huggingface.co/spaces/<tu-usuario>/aetheris
+   git push hf main
+   ```
+
+3. **Configurar secretos** en *Settings → Repository secrets*:
+
+   | Secreto | Descripción |
+   |---|---|
+   | `OPENAI_API_KEY` | Clave OpenAI |
+   | `LANGSMITH_API_KEY` | Clave LangSmith |
+   | `TAVILY_API_KEY` | Clave Tavily (opcional) |
+   | `GOOGLE_REFRESH_TOKEN` | Refresh token OAuth2 Google |
+   | `GOOGLE_CLIENT_SECRET_JSON` | Contenido base64 del client_secret JSON |
+
+   Obtener `GOOGLE_CLIENT_SECRET_JSON`:
+   ```bash
+   # Linux / Mac
+   base64 -w 0 data/google/client_secret_aetheris.json
+
+   # Windows PowerShell
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes('data\google\client_secret_aetheris.json'))
+   ```
+
+4. HF Spaces construirá la imagen automáticamente al detectar el `Dockerfile`.
+   El entrypoint (`scripts/entrypoint.sh`) decodifica los secretos y arranca supervisord.
+
+### Build local Docker
+
+```bash
+# Construir la imagen
+docker build -t aetheris .
+
+# Ejecutar localmente (equivalente a HF Spaces)
+docker run -p 7860:7860 \
+  -e OPENAI_API_KEY=sk-... \
+  -e GOOGLE_REFRESH_TOKEN=1//... \
+  -e GOOGLE_CLIENT_SECRET_JSON=$(base64 -w 0 data/google/client_secret_aetheris.json) \
+  aetheris
+```
+
+Abre [http://localhost:7860](http://localhost:7860) en tu navegador.
 
 ---
 
