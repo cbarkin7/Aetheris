@@ -49,75 +49,79 @@ except Exception as e:
     CLIENT_ID=$(echo "$CLIENT_DATA" | awk '{print $1}')
     CLIENT_SECRET=$(echo "$CLIENT_DATA" | awk '{print $2}')
 
-    # .calendar-token.json
+    # Obtener access_token fresco via curl (más fiable que esperar a que Python lo haga)
+    echo "[entrypoint] Obteniendo access_token fresco via OAuth2..."
+    TOKEN_RESPONSE=$(curl -s -X POST "https://oauth2.googleapis.com/token" \
+        -d "client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&refresh_token=${GOOGLE_REFRESH_TOKEN}&grant_type=refresh_token")
+    ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('access_token',''))" 2>/dev/null || echo "")
+    EXPIRES_IN=$(echo "$TOKEN_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('expires_in',3599))" 2>/dev/null || echo "3599")
+
+    if [ -n "$ACCESS_TOKEN" ]; then
+        echo "[entrypoint] access_token obtenido correctamente"
+    else
+        echo "[entrypoint] AVISO: no se pudo obtener access_token — comprueba GOOGLE_REFRESH_TOKEN"
+        echo "[entrypoint] Respuesta OAuth: $(echo "$TOKEN_RESPONSE" | head -c 200)"
+    fi
+
+    # Calcular expiry_date en milisegundos
+    NOW_MS=$(python3 -c "import time; print(int((time.time() + int('${EXPIRES_IN}') - 60) * 1000))")
+
+    # .calendar-token.json — formato multi-cuenta {"normal": {...}, "personal": {...}}
     CALENDAR_TOKEN="$GOOGLE_DIR/.calendar-token.json"
-    if [ ! -f "$CALENDAR_TOKEN" ]; then
-        python3 -c "
+    python3 -c "
 import json
-token = {
-    'token': None,
-    'refresh_token': '$GOOGLE_REFRESH_TOKEN',
-    'token_uri': 'https://oauth2.googleapis.com/token',
-    'client_id': '$CLIENT_ID',
-    'client_secret': '$CLIENT_SECRET',
-    'scopes': ['https://www.googleapis.com/auth/calendar'],
-    'expiry': None
+entry = {
+    'access_token': '${ACCESS_TOKEN}',
+    'refresh_token': '${GOOGLE_REFRESH_TOKEN}',
+    'scope': 'https://www.googleapis.com/auth/calendar',
+    'token_type': 'Bearer',
+    'expiry_date': ${NOW_MS},
 }
-with open('$CALENDAR_TOKEN', 'w') as f:
+token = {'normal': entry, 'personal': dict(entry)}
+with open('${CALENDAR_TOKEN}', 'w') as f:
     json.dump(token, f, indent=2)
 print('[entrypoint] .calendar-token.json creado')
 "
-    else
-        echo "[entrypoint] .calendar-token.json ya existe — reutilizando"
-    fi
 
-    # .gmail-token.json
+    # .gmail-token.json — formato google-auth con client_id/secret para auto-refresh
     GMAIL_TOKEN="$GOOGLE_DIR/.gmail-token.json"
-    if [ ! -f "$GMAIL_TOKEN" ]; then
-        python3 -c "
+    python3 -c "
 import json
 token = {
-    'access_token': None,
-    'refresh_token': '$GOOGLE_REFRESH_TOKEN',
+    'access_token': '${ACCESS_TOKEN}',
+    'refresh_token': '${GOOGLE_REFRESH_TOKEN}',
     'token_uri': 'https://oauth2.googleapis.com/token',
-    'client_id': '$CLIENT_ID',
-    'client_secret': '$CLIENT_SECRET',
+    'client_id': '${CLIENT_ID}',
+    'client_secret': '${CLIENT_SECRET}',
     'scopes': [
         'https://www.googleapis.com/auth/gmail.modify',
         'https://www.googleapis.com/auth/gmail.readonly',
         'https://www.googleapis.com/auth/gmail.send'
     ],
-    'expiry': None
+    'expiry_date': ${NOW_MS},
 }
-with open('$GMAIL_TOKEN', 'w') as f:
+with open('${GMAIL_TOKEN}', 'w') as f:
     json.dump(token, f, indent=2)
 print('[entrypoint] .gmail-token.json creado')
 "
-    else
-        echo "[entrypoint] .gmail-token.json ya existe — reutilizando"
-    fi
 
-    # .drive-token.json (mismo refresh token, scope Drive)
+    # .drive-token.json — formato authorized_user requerido por @piotr-agier/google-drive-mcp
     DRIVE_TOKEN="$GOOGLE_DIR/.drive-token.json"
-    if [ ! -f "$DRIVE_TOKEN" ]; then
-        python3 -c "
+    python3 -c "
 import json
 token = {
-    'token': None,
-    'refresh_token': '$GOOGLE_REFRESH_TOKEN',
+    'type': 'authorized_user',
+    'client_id': '${CLIENT_ID}',
+    'client_secret': '${CLIENT_SECRET}',
+    'refresh_token': '${GOOGLE_REFRESH_TOKEN}',
+    'access_token': '${ACCESS_TOKEN}',
+    'expiry_date': ${NOW_MS},
     'token_uri': 'https://oauth2.googleapis.com/token',
-    'client_id': '$CLIENT_ID',
-    'client_secret': '$CLIENT_SECRET',
-    'scopes': ['https://www.googleapis.com/auth/drive'],
-    'expiry': None
 }
-with open('$DRIVE_TOKEN', 'w') as f:
+with open('${DRIVE_TOKEN}', 'w') as f:
     json.dump(token, f, indent=2)
 print('[entrypoint] .drive-token.json creado')
 "
-    else
-        echo "[entrypoint] .drive-token.json ya existe — reutilizando"
-    fi
 else
     echo "[entrypoint] GOOGLE_REFRESH_TOKEN no definido — herramientas Google desactivadas"
 fi
