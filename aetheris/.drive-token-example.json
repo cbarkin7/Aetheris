@@ -1,0 +1,9 @@
+{
+  "type": "authorized_user",
+  "client_id": "25686103...",
+  "client_secret": "GOCS...",
+  "refresh_token": "1//03igL...",
+  "access_token": "ya29.a0AQ...",
+  "expiry_date": 1778869290451,
+  "token_uri": "https://oauth2.googleapis.com/token"
+}

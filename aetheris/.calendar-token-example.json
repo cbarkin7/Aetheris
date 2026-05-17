@@ -1,0 +1,16 @@
+{
+  "normal": {
+    "access_token": "ya29.a0AQ...",
+    "refresh_token": "1//03igL...",
+    "scope": "https://www.googleapis.com/auth/calendar",
+    "token_type": "Bearer",
+    "expiry_date": 1778869230685
+  },
+  "personal": {
+    "access_token": "ya29.a0AQ...",
+    "refresh_token": "1//03igL...",
+    "scope": "https://www.googleapis.com/auth/calendar",
+    "token_type": "Bearer",
+    "expiry_date": 1778869230685
+  }
+}

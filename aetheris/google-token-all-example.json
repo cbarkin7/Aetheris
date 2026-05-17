@@ -1,0 +1,8 @@
+{
+  "access_token": "ya29.a0A...",
+  "expires_in": 3599,
+  "refresh_token": "1//03zRk7S...",
+  "scope": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.modify",
+  "token_type": "Bearer",
+  "refresh_token_expires_in": 604799
+}

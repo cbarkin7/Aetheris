@@ -1,0 +1,9 @@
+{
+  "access_token": "ya29.a0A...",
+  "refresh_token": "1//03igL...",
+  "scope": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+  "token_type": "Bearer",
+  "expiry_date": 1778869230685,
+  "client_id": "2568610381...",
+  "client_secret": "GOCSP..."
+}
