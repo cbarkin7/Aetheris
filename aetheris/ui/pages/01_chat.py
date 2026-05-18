@@ -131,7 +131,7 @@ def _send_message(prompt: str) -> None:
                     "stream": True,
                 },
                 stream=True,
-                timeout=(10, 180),
+                timeout=(30, 180),
             )
             resp.raise_for_status()
 
@@ -303,7 +303,7 @@ if st.session_state.hitl_pending:
                 f"{API_BASE}/api/v1/chat/{st.session_state.thread_id}/resume",
                 json={"approved": approval, "user_id": st.session_state.user_id},
                 stream=True,
-                timeout=60,
+                timeout=(30, 300),
             )
             resp.raise_for_status()
         except Exception as exc:

@@ -71,7 +71,11 @@ Reglas de planificación (en orden estricto de prioridad):
                     Cuando tengas duda entre rag y google_action, elige google_action.
 3. "web_search"    — SOLO cuando el usuario lo pida EXPLÍCITAMENTE con palabras como:
                     "busca en internet", "amplía", "novedad", "actualidad", "noticias",
-                    "qué dice internet", "busca externamente", "información reciente".
+                    "qué dice internet", "busca externamente", "información reciente",
+                    "extrae el contenido de", "accede a esta URL", "lee esta web", "lee esta URL",
+                    "mapea el sitio", "mapea la estructura", "estructura de URLs",
+                    "rastrea el sitio", "rastrear", "crawl", "sitio web completo",
+                    "análisis exhaustivo", "investigación profunda", "en profundidad".
                     NO uses web_search por iniciativa propia.
 4. ["rag", "web_search"] — SOLO cuando el usuario pida combinar sus documentos con
                     información externa (ej. "¿qué decía mi informe? ¿hay novedades?").
